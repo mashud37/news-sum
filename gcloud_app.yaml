@@ -1,0 +1,95 @@
+# Standardized deployment manifest — see ../GCLOUD_POLICY.md
+# Source of truth for `python ../manage.py`. deploy.sh is the standalone fallback.
+app: news-sum
+prefix: news
+region: europe-west1
+type: jobs
+
+artifact_registry:
+  repo: news
+  image: news/app:latest
+
+service_account:
+  name: news-sa
+  display: "News pipeline — Cloud Scheduler invoker"
+  roles: [roles/run.invoker]
+
+uses_secrets: true
+
+buckets:
+  - role: state
+    suffix: news-state
+  - role: site
+    suffix: news-site
+    public: true
+    web_main_page: digest.html
+
+common_env:
+  GCS_BUCKET: "{BUCKET_STATE}"
+  GCP_PROJECT: "{PROJECT}"
+
+# Secret Manager secrets can be sourced from ../user_config.yaml (populate the
+# file manually) instead of the install prompt. Maps secret name -> config key.
+# If the config value is a path to an existing file, it's uploaded as the secret
+# (handy for the Gmail OAuth token JSON); otherwise it's used as the literal value.
+secrets_from_shared:
+  news-smtp-pass: smtp_pass
+  news-anthropic-key: anthropic_api_key
+  news-gmail-oauth-token: gmail_oauth_token_file
+
+# SMTP_* are non-secret config baked into the digest job below. Adjust as needed.
+jobs:
+  - name: news-ingest-rss
+    env: { JOB: ingest_rss }
+    memory: 1Gi
+    timeout: 300s
+    max_retries: 1
+  - name: news-ingest-gmail
+    optional: true            # skipped (with its scheduler) if the secret is absent
+    env: { JOB: ingest_gmail }
+    secrets: { GMAIL_OAUTH_TOKEN: "news-gmail-oauth-token:latest" }
+    memory: 1Gi
+    timeout: 300s
+    max_retries: 1
+  - name: news-ingest-newsroom
+    env: { JOB: ingest_newsroom }
+    memory: 1Gi
+    timeout: 900s
+    max_retries: 1
+  - name: news-weekly-digest
+    env:
+      JOB: digest
+      GCS_SITE_BUCKET: "{BUCKET_SITE}"
+      SMTP_HOST: "{SMTP_HOST}"
+      SMTP_USER: "{SMTP_USER}"
+      SMTP_FROM: "{SMTP_USER}"
+      DIGEST_TO: "{EMAIL_TO}"
+    secrets:
+      ANTHROPIC_API_KEY: "news-anthropic-key:latest"
+      SMTP_PASS: "news-smtp-pass:latest"
+    memory: 2Gi
+    cpu: 2
+    timeout: 1800s
+    max_retries: 1
+
+schedulers:
+  - name: news-ingest-rss-sched
+    schedule: "0 7 * * *"
+    time_zone: Europe/Berlin
+    target_job: news-ingest-rss
+    auth: oauth
+  - name: news-ingest-gmail-sched
+    schedule: "0 8 * * *"
+    time_zone: Europe/Berlin
+    target_job: news-ingest-gmail
+    auth: oauth
+  - name: news-ingest-newsroom-sched
+    schedule: "0 9 * * 1"
+    time_zone: Europe/Berlin
+    target_job: news-ingest-newsroom
+    auth: oauth
+  - name: news-weekly-digest-sched
+    schedule: "0 8 * * 0"
+    time_zone: Europe/Berlin
+    target_job: news-weekly-digest
+    auth: oauth

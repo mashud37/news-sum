@@ -1,0 +1,32 @@
+# Local article data — must never end up in the image (PII, project state).
+pipeline.db
+pipeline.db-journal
+pipeline.db-wal
+pipeline.db-shm
+articles.csv
+articles.json
+temp/
+
+# Python caches and bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+
+# Local env / credential files (defensive — see ../user_config.yaml)
+.env
+env.yaml
+*.token.json
+
+# Local-only Streamlit dashboards launched via manage.py. Never run in
+# Cloud Run; their deps (streamlit, pandas) would only bloat the image.
+dashboards/
+
+# VCS metadata (defensive — repo is not currently git-tracked)
+.git/
+.gitignore

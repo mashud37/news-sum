@@ -1,0 +1,14 @@
+requests>=2.32,<3
+feedparser==6.0.11
+selectolax==0.3.21
+google-cloud-storage==2.18.2
+google-cloud-secret-manager==2.20.2
+google-auth==2.35.0
+google-api-python-client==2.149.0
+scikit-learn==1.5.2
+scipy==1.14.1
+rank-bm25==0.2.2
+numpy==1.26.4
+anthropic>=0.45.0
+spacy>=3.7,<4
+matplotlib==3.9.2
