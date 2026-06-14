@@ -259,27 +259,34 @@ def entity_vocabulary_growth(conn, weeks=12):
 def persistence_prediction_auc(conn, weeks=12):
     """Per week: rolling AUC of the scorer's score → topic persistence label.
 
-    Persistence label: 1 if the cluster's topic later appeared in another
-    week, 0 otherwise. Computed cumulatively up to each evaluation week.
+    Persistence label is leak-free: a row at (week=wk, topic_id=t) "persisted"
+    iff that same topic_id appears in cluster_signals for any week > wk.
+    Only rows with week <= eval_week are included, so each eval_week is an
+    honest forward prediction from that point in history.
+
     This is the only semi-objective anchor in this module; everything else
     is a proxy."""
     wks = _recent_weeks(conn, "cluster_signals", "week", weeks)
     if not wks:
         return INSUFFICIENT(0)
+
+    all_rows = conn.execute(
+        "SELECT week, topic_id, score FROM cluster_signals WHERE topic_id IS NOT NULL"
+    ).fetchall()
+
+    later_by_topic = {}
+    for row_wk, tid, _ in all_rows:
+        if tid not in later_by_topic:
+            later_by_topic[tid] = set()
+        later_by_topic[tid].add(row_wk)
+
     out = {}
     for wk in wks:
-        rows = conn.execute(
-            "SELECT cs.score, cs.week, tb.weeks_seen, tb.last_week "
-            "FROM cluster_signals cs LEFT JOIN topic_bank tb ON cs.topic_id = tb.topic_id "
-            "WHERE cs.week <= ? AND cs.topic_id IS NOT NULL",
-            (wk,),
-        ).fetchall()
         scores, labels = [], []
-        for score, row_wk, weeks_seen, last_week in rows:
-            if weeks_seen is None or last_week is None:
-                persisted = 0
-            else:
-                persisted = int((weeks_seen >= 2) and last_week > row_wk)
+        for row_wk, tid, score in all_rows:
+            if row_wk > wk:
+                continue
+            persisted = int(any(w > row_wk for w in later_by_topic.get(tid, set())))
             scores.append(score)
             labels.append(persisted)
         if len(set(labels)) < 2:

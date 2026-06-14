@@ -142,6 +142,8 @@ if len(w_rows) >= 2:
             "The `relevance` term is floored — see RELEVANCE_FLOOR in digest.py."
         )
         with st.expander("Latest weights vs default"):
+            # Mirror of digest.DEFAULT_WEIGHTS — kept inline so this dashboard
+            # stays a streamlit+pandas-only tool (no heavy pipeline import).
             from_defaults = {
                 "coverage": 0.14, "prior": 0.07, "novelty": 0.09, "relevance": 0.20,
                 "entity_signal": 0.06, "trend": 0.05, "richness": 0.06,

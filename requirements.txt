@@ -12,3 +12,4 @@ numpy==1.26.4
 anthropic>=0.45.0
 spacy>=3.7,<4
 matplotlib==3.9.2
+sentence-transformers>=3.0,<4

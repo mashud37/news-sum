@@ -24,8 +24,8 @@ Cloud Scheduler (4 cron triggers)
   +-- news-ingest-newsroom (Mon  09:00 Berlin)    -- 24 scraped newsrooms
   +-- news-weekly-digest   (Sun  08:00 Berlin)
             |
-            +-- enrich (SpaCy NER + VADER sentiment)
-            +-- two-lane clustering (TF-IDF + MinHash LSH, title+body and title-only)
+            +-- enrich (SpaCy NER)
+            +-- two-lane clustering (TF-IDF average-linkage agglomerative, title+body and title-only)
             +-- 11-factor scoring  -->  MMR dynamic selection (score-knee)
             +-- topic bank update (persistence + dormancy)
             +-- LLM spotlight per (sector, category)   [Claude Haiku 4.5]
@@ -131,7 +131,7 @@ Pricing assumes no free-tier credits. Cloud Run: $0.000024/vCPU-s, $0.0000025/Gi
 | Claude Haiku (digest + macro) | 4–5 runs | ~20K in / 1.5K out | $0.06 |
 | **Total** | | | **~$1.14/month** |
 
-Cost controls: jobs scale to zero between runs; RSS HTTP caching (ETag/Last-Modified) skips unchanged feeds; MinHash LSH avoids O(n²) dedup; MMR caps LLM input at the score-knee regardless of corpus size; newsroom scraping is weekly with a 2-second crawl delay.
+Cost controls: jobs scale to zero between runs; RSS HTTP caching (ETag/Last-Modified) skips unchanged feeds; MMR caps LLM input at the score-knee regardless of corpus size; newsroom scraping is weekly with a 2-second crawl delay.
 
 ---
 

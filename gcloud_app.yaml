@@ -67,7 +67,7 @@ jobs:
     secrets:
       ANTHROPIC_API_KEY: "news-anthropic-key:latest"
       SMTP_PASS: "news-smtp-pass:latest"
-    memory: 2Gi
+    memory: 4Gi
     cpu: 2
     timeout: 1800s
     max_retries: 1

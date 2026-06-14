@@ -28,12 +28,59 @@ from common import (
     CATEGORIES
 )
 
+EMBED_MODEL = "all-MiniLM-L6-v2"
+_EMBED_BODY_CHARS = 500
+
+_embedder_cache = None
+_embedder_loaded = False
+
+
+def _embedder():
+    global _embedder_cache, _embedder_loaded
+    if _embedder_loaded:
+        return _embedder_cache
+    _embedder_loaded = True
+    try:
+        from sentence_transformers import SentenceTransformer
+        _embedder_cache = SentenceTransformer(EMBED_MODEL)
+    except Exception:
+        _embedder_cache = None
+    return _embedder_cache
+
+
+def _embed(texts):
+    """Encode a list of strings to a normalized (n, d) float32 ndarray, or None."""
+    model = _embedder()
+    if model is None or not texts:
+        return None
+    try:
+        return model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+    except Exception:
+        return None
+
+
+_aspect_emb_cache = {}
+
+
+def _embed_aspects(aspects, cache_key):
+    """Encode aspect descriptors; cache by profile hash so we encode once per run."""
+    if cache_key in _aspect_emb_cache:
+        return _aspect_emb_cache[cache_key]
+    if _embedder() is None:
+        return None
+    texts = [desc for _, desc in aspects]
+    embs = _embed(texts)
+    _aspect_emb_cache[cache_key] = embs
+    return embs
+
 _nlp = spacy.load("en_core_web_sm", disable=["parser", "lemmatizer"])
 # Rule-based sentence boundaries (cheap; parser is still disabled). Needed by
 # the sentence-level MMR medoid summary and the lexical-cohesion richness term.
 if "sentencizer" not in _nlp.pipe_names:
     _nlp.add_pipe("sentencizer")
 _NER_LABELS = {"ORG", "PERSON", "GPE", "PRODUCT", "MONEY", "PERCENT", "DATE"}
+_ENTITY_SIGNAL_LABELS = {"ORG", "PERSON", "GPE", "PRODUCT"}
+_SOURCE_NAMES = frozenset(k.lower() for k in SOURCE_SECTOR)
 
 # Default scorer weights (before any adaptive tuning).
 # Anchor invariant: USER_PROFILE defines the discourse space; the relevance term
@@ -53,6 +100,7 @@ DEFAULT_WEIGHTS = {
     "recency":        0.10,
 }
 RELEVANCE_FLOOR = 0.20
+DUMP_RELEVANCE_FLOOR = 0.12
 WEIGHT_KEYS = list(DEFAULT_WEIGHTS.keys())
 
 
@@ -164,6 +212,10 @@ def _lexical_cohesion(text):
 
 
 # ── NLP enrichment ────────────────────────────────────────────────────────────
+
+def _is_signal_entity(text, label):
+    return label in _ENTITY_SIGNAL_LABELS and text.lower() not in _SOURCE_NAMES
+
 
 def enrich(rows):
     items = []
@@ -892,21 +944,28 @@ def _enforce_floor(weights):
     return w
 
 
+_TUNE_KEYS = [
+    "coverage", "prior", "novelty", "relevance",
+    "entity_signal", "trend", "richness", "coverage_gap",
+]
+
 def tune_weights(conn, min_weeks=10):
     """Fit logistic regression of signals → topic-persistence and blend the
     learned weights with the current weights. Skips if history is shallow or
     the persistence label is degenerate. Writes a row to scorer_weights and
     logs old vs new.
 
-    Proxy target: did a cluster's topic persist into a later week (as
-    recorded in topic_bank). This is the only semi-objective anchor available
-    without user feedback. The blend (0.7 old / 0.3 learned) and the
-    relevance floor (RELEVANCE_FLOOR) keep the system from drifting."""
+    Only the 8 signals stored in cluster_signals are fitted (_TUNE_KEYS).
+    persistence/source_breadth/recency are carried over from current weights
+    unchanged — persistence would leak (it is bank-derived, same axis as the
+    label), and the other two are recency heuristics without historical rows.
+
+    Persistence label is leak-free: a row at (week=wk, topic_id=t) "persisted"
+    iff that same topic_id appears in cluster_signals for any week > wk."""
     rows = conn.execute(
         "SELECT cs.week, cs.topic_id, cs.coverage, cs.prior, cs.novelty, "
-        "cs.relevance, cs.entity_signal, cs.trend, cs.richness, cs.coverage_gap, "
-        "tb.weeks_seen, tb.last_week "
-        "FROM cluster_signals cs LEFT JOIN topic_bank tb ON cs.topic_id = tb.topic_id "
+        "cs.relevance, cs.entity_signal, cs.trend, cs.richness, cs.coverage_gap "
+        "FROM cluster_signals cs "
         "WHERE cs.topic_id IS NOT NULL"
     ).fetchall()
     weeks_in_data = {r[0] for r in rows}
@@ -914,16 +973,19 @@ def tune_weights(conn, min_weeks=10):
         print(f"tune_weights: skip ({len(weeks_in_data)} weeks < {min_weeks})")
         return None
 
+    later_weeks = {}
+    for r in rows:
+        tid = r[1]
+        wk = r[0]
+        if tid not in later_weeks:
+            later_weeks[tid] = set()
+        later_weeks[tid].add(wk)
+
     X, y = [], []
     for r in rows:
-        wk = r[0]
-        signals = list(r[2:10])  # coverage, prior, novelty, relevance, entity_signal, trend, richness, coverage_gap
-        weeks_seen, last_week = r[10], r[11]
-        if weeks_seen is None:
-            persisted = 0
-        else:
-            persisted = int((weeks_seen >= 2) and last_week is not None
-                            and last_week > wk)
+        wk, tid = r[0], r[1]
+        signals = list(r[2:10])
+        persisted = int(any(w > wk for w in later_weeks.get(tid, set())))
         X.append(signals)
         y.append(persisted)
     X = np.array(X, dtype=float)
@@ -936,16 +998,21 @@ def tune_weights(conn, min_weeks=10):
     lr = LogisticRegression(max_iter=500)
     lr.fit(X, y)
     coefs = lr.coef_[0]
-    # Map signals → weights via positive-clipped, normalised coefficients.
     pos = np.clip(coefs, 0, None)
     if pos.sum() <= 0:
         print("tune_weights: skip (no positive coefficients)")
         return None
-    learned = {k: float(pos[i] / pos.sum()) for i, k in enumerate(WEIGHT_KEYS)}
 
     current = load_weights(conn)
+    learned_partial = {k: float(pos[i] / pos.sum()) for i, k in enumerate(_TUNE_KEYS)}
+    frozen_keys = [k for k in WEIGHT_KEYS if k not in learned_partial]
+    frozen_total = sum(current.get(k, 0.0) for k in frozen_keys)
+    fit_total = 1.0 - frozen_total
+    learned = {k: learned_partial.get(k, 0.0) * max(fit_total, 1e-9) for k in WEIGHT_KEYS}
+    for k in frozen_keys:
+        learned[k] = current.get(k, DEFAULT_WEIGHTS[k])
+
     blended = {k: 0.7 * current[k] + 0.3 * learned[k] for k in WEIGHT_KEYS}
-    # renorm and floor
     total = sum(blended.values())
     if total > 0:
         blended = {k: v / total for k, v in blended.items()}
@@ -1030,7 +1097,7 @@ def _cluster_top_entities(idxs, items, velocities, n=5):
     counts = defaultdict(int)
     for i in idxs:
         for e, label in items[i]["entities"].items():
-            if label in {"ORG", "PERSON", "PRODUCT"}:
+            if _is_signal_entity(e, label) and label in {"ORG", "PERSON", "PRODUCT"}:
                 counts[e] += 1
     return sorted(
         counts.items(),
@@ -1040,7 +1107,8 @@ def _cluster_top_entities(idxs, items, velocities, n=5):
 
 
 def score_clusters(clusters, items, X, vec, velocities, bank, aspects, debt,
-                   entity_idf, max_idf, weights, week, exclusion_aspects=None):
+                   entity_idf, max_idf, weights, week, exclusion_aspects=None,
+                   E=None):
     """Score clusters with the dict-weighted linear model.
 
     Returns (scored_clusters, aspect_coverage) where aspect_coverage is the
@@ -1049,17 +1117,55 @@ def score_clusters(clusters, items, X, vec, velocities, bank, aspects, debt,
 
     `exclusion_aspects` (optional): list of (label, descriptor) decomposed
     from USER_PROFILE's 'Not relevant' clause. When present, each cluster
-    gets a `profile_exclusion` signal (BM25 of any exclusion descriptor vs
-    the cluster medoid, normalised across clusters) used by the
-    pre-MMR off-profile filter in run()."""
+    gets a `profile_exclusion` signal used by the pre-MMR off-profile filter.
+
+    `E` (optional): (n_items, d) normalized dense embedding matrix computed
+    once by run(). When present, a dense lane is RRF-fused with the lexical
+    BM25 lane for both relevance and exclusion (§6.12 hybrid recipe). When
+    absent, falls back to pure lexical behavior."""
     medoids = [cluster_medoid(c, X) for c in clusters]
     medoid_vecs = sp.vstack([X[m] for m in medoids])
 
     corpus = [_norm(f"{a['title']} {a['body']}").split() for a in items]
     bm25 = BM25Okapi(corpus)
-    user_q = _norm(USER_PROFILE).split()
-    raw_bm25 = bm25.get_scores(user_q)
-    relevance = _normalize(np.array([raw_bm25[m] for m in medoids]))
+
+    ph = _profile_hash()
+    _RRF_K = 60
+    n_cl = len(clusters)
+
+    # ── relevance: per-aspect BM25 RRF (lexical lane) ────────────────────────
+    rrf_lex = np.zeros(n_cl)
+    if aspects:
+        for _a, desc in aspects:
+            desc_tokens = _norm(desc).split() or _norm(_a).split()
+            if not desc_tokens:
+                continue
+            scores = bm25.get_scores(desc_tokens)
+            raw = np.array([scores[m] for m in medoids])
+            order = np.argsort(-raw)
+            for rank, idx in enumerate(order):
+                rrf_lex[idx] += 1.0 / (_RRF_K + rank + 1)
+    else:
+        user_q = _norm(USER_PROFILE).split()
+        raw_bm25 = bm25.get_scores(user_q)
+        rrf_lex = np.array([raw_bm25[m] for m in medoids])
+
+    # ── relevance: dense lane (aspect cosine via RRF), fused with lexical ────
+    rrf_dense_rel = np.zeros(n_cl)
+    aspect_embs = _embed_aspects(aspects, ph) if (E is not None and aspects) else None
+    if aspect_embs is not None and E is not None:
+        medoid_embs = E[medoids]                       # (n_cl, d)
+        for a_idx in range(len(aspects)):
+            q_vec = aspect_embs[a_idx]                 # (d,)
+            sims = medoid_embs @ q_vec                 # (n_cl,)
+            order = np.argsort(-sims)
+            for rank, idx in enumerate(order):
+                rrf_dense_rel[idx] += 1.0 / (_RRF_K + rank + 1)
+        rrf_scores = rrf_lex + rrf_dense_rel
+    else:
+        rrf_scores = rrf_lex
+
+    relevance = _normalize(rrf_scores)
 
     sizes = np.array([len(c) for c in clusters])
     coverage = np.log1p(sizes) / np.log1p(max(sizes.max(), 1))
@@ -1094,8 +1200,9 @@ def score_clusters(clusters, items, X, vec, velocities, bank, aspects, debt,
     for c in clusters:
         ent_counts = defaultdict(int)
         for i in c:
-            for e in items[i]["entities"]:
-                ent_counts[e] += 1
+            for e, lbl in items[i]["entities"].items():
+                if _is_signal_entity(e, lbl):
+                    ent_counts[e] += 1
         signal = 0.0
         for e, cnt in ent_counts.items():
             idf_w = entity_idf.get(e, max_idf)
@@ -1141,23 +1248,34 @@ def score_clusters(clusters, items, X, vec, velocities, bank, aspects, debt,
                 gap_raw[i] = float(debt.get(aspect_keys[best_aspect_idx[i]], 0.0))
         coverage_gap = _normalize(gap_raw) if gap_raw.max() > 0 else gap_raw
 
-    # Profile-exclusion signal (Layer A of §2.4). Symmetric to coverage_gap
-    # but indexed against the "Not relevant" half of USER_PROFILE. Used as a
-    # filter input (run() drops high-exclusion + low-relevance clusters
-    # pre-MMR) — NOT as a positive score term, since we don't want it
-    # influencing ranking among on-profile clusters.
-    profile_exclusion = np.zeros(len(clusters))
+    # Profile-exclusion signal (Layer A of §2.4). Hybrid: lexical BM25 max
+    # across exclusion-aspect descriptors, RRF-fused with a dense cosine lane
+    # when E is available. The dense lane is what catches celebrity/consumer-
+    # tech leakage where BM25 vocabulary fails (evaluation §1). Used as a
+    # filter input only — NOT a positive score term.
+    profile_exclusion = np.zeros(n_cl)
     if exclusion_aspects:
-        excl_max = np.zeros(len(clusters))
+        excl_lex = np.zeros(n_cl)
         for a, desc in exclusion_aspects:
             desc_tokens = _norm(desc).split() or _norm(a).split()
             if not desc_tokens:
                 continue
             scores_excl = bm25.get_scores(desc_tokens)
             arr = np.array([scores_excl[m] for m in medoids])
-            excl_max = np.maximum(excl_max, arr)
-        if excl_max.max() > 0:
-            profile_exclusion = _normalize(excl_max)
+            excl_lex = np.maximum(excl_lex, arr)
+
+        excl_dense = np.zeros(n_cl)
+        excl_embs = _embed_aspects(exclusion_aspects, ph + "_excl") if E is not None else None
+        if excl_embs is not None and E is not None:
+            medoid_embs = E[medoids]
+            for a_idx in range(len(exclusion_aspects)):
+                q_vec = excl_embs[a_idx]
+                sims = medoid_embs @ q_vec
+                excl_dense = np.maximum(excl_dense, sims)
+
+        combined = excl_lex / (excl_lex.max() + 1e-9) + excl_dense / (excl_dense.max() + 1e-9)
+        if combined.max() > 0:
+            profile_exclusion = _normalize(combined)
 
     # Persistence rate (Layer B precursor of §2.4). For each cluster's
     # matched topic in the bank, the empirical recurrence rate
@@ -1325,6 +1443,12 @@ def _filter_off_profile(scored, history_weeks, relevance_floor=0.10,
     matched topic must have a non-trivial recurrence rate) to survive.
     Topics with no match in the bank (persistence_rate == -1) are treated
     as failing the persistence test only once history is deep enough.
+
+    Additionally, clusters below DUMP_RELEVANCE_FLOOR with non-trivial
+    exclusion are dropped regardless of the other gates — these are the
+    low-signal off-profile items that leak into the ALL STORIES dump.
+    On-profile clusters (profile_exclusion == 0.0) are never dropped by
+    this secondary gate so the rule cannot suppress genuine coverage.
     """
     layer_b = history_weeks >= 10
     out = []
@@ -1335,11 +1459,11 @@ def _filter_off_profile(scored, history_weeks, relevance_floor=0.10,
         if excl > rel and rel < relevance_floor:
             if not layer_b:
                 continue
-            # Layer B: persistence override — a high-exclusion cluster can
-            # survive if its matched topic has actually recurred.
             pers = s.get("persistence_rate", -1.0)
             if pers < persistence_floor:
                 continue
+        if excl > 0.0 and rel < DUMP_RELEVANCE_FLOOR:
+            continue
         out.append(c)
     return out
 
@@ -2138,10 +2262,20 @@ def run():
         X, vec, edges = build_tfidf(items)
         clusters = cluster_average_linkage(X)
 
+        item_texts = [
+            f"{a['title']} {(a['body'] or '')[:_EMBED_BODY_CHARS]}" for a in items
+        ]
+        E = _embed(item_texts)
+        if E is not None:
+            print(f"embeddings: {E.shape[0]} items × {E.shape[1]} dims")
+        else:
+            print("embeddings: unavailable, using lexical-only fallback")
+
         all_ent_counts = defaultdict(int)
         for a in items:
-            for e in a["entities"]:
-                all_ent_counts[e] += 1
+            for e, lbl in a["entities"].items():
+                if _is_signal_entity(e, lbl):
+                    all_ent_counts[e] += 1
         ent_history = load_entity_history(conn)
         velocities = compute_velocities(all_ent_counts, ent_history)
 
@@ -2155,7 +2289,10 @@ def run():
         bank = load_topic_bank(conn)
         # tune_weights runs before scoring so this week uses the latest blend;
         # it no-ops until cluster_signals has accumulated >= 10 weeks.
-        tune_weights(conn)
+        try:
+            tune_weights(conn)
+        except Exception as _tw_exc:
+            print(f"tune_weights failed, continuing with existing weights: {_tw_exc}")
         weights = load_weights(conn)
 
         # History depth gates both the off-profile filter's Layer B
@@ -2168,6 +2305,7 @@ def run():
             clusters, items, X, vec, velocities, bank, aspects, debt,
             entity_idf, max_idf, weights, week,
             exclusion_aspects=exclusion_aspects,
+            E=E,
         )
 
         # §2.4 — off-profile filter (Layer A always, Layer B at >= 10 weeks).
