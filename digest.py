@@ -2252,16 +2252,34 @@ def save_digest(conn, top, items, summary, vec):
 
 def run():
     with pipeline_lock():
+        print("digest: starting")
+        print("  · 1/12  Pull DB")
+        print("  · 2/12  Load & enrich items")
+        print("  · 3/12  Build TF-IDF + cluster")
+        print("  · 4/12  Embed items")
+        print("  · 5/12  Load discourse context")
+        print("  · 6/12  Score clusters")
+        print("  · 7/12  MMR select + dedup")
+        print("  · 8/12  Update topic bank")
+        print("  · 9/12  LLM summarise")
+        print("  · 10/12 Save digest state")
+        print("  · 11/12 Push DB + publish")
+        print("  · 12/12 Send email")
+
+        print("digest [1/12] pulling db")
         conn = pull_db()
         rows = load_week_items(conn)
         if len(rows) < 10:
             print(f"too few items: {len(rows)}")
             return
 
+        print(f"digest [2/12] enriching {len(rows)} items")
         items = enrich(rows)
+        print("digest [3/12] building TF-IDF + clustering")
         X, vec, edges = build_tfidf(items)
         clusters = cluster_average_linkage(X)
 
+        print(f"digest [4/12] embedding {len(items)} items")
         item_texts = [
             f"{a['title']} {(a['body'] or '')[:_EMBED_BODY_CHARS]}" for a in items
         ]
@@ -2281,6 +2299,7 @@ def run():
 
         week = datetime.now(timezone.utc).strftime("%Y-W%V")
 
+        print("digest [5/12] loading discourse context")
         # Discourse-learning context: IDF, aspects, debt, topic bank, weights.
         entity_idf, max_idf = load_entity_idf(conn)
         aspects = get_profile_aspects(conn)
@@ -2301,6 +2320,7 @@ def run():
             "SELECT COUNT(DISTINCT week) FROM cluster_signals"
         ).fetchone()[0] or 0
 
+        print(f"digest [6/12] scoring {len(clusters)} clusters")
         scored, aspect_coverage = score_clusters(
             clusters, items, X, vec, velocities, bank, aspects, debt,
             entity_idf, max_idf, weights, week,
@@ -2314,6 +2334,7 @@ def run():
         print(f"off-profile filter: {before_filter} -> {len(scored)} clusters "
               f"(history_weeks={history_weeks})")
 
+        print("digest [7/12] MMR select + dedup")
         # §2.5 — dynamic, score-knee-aware selection (replaces k=15).
         top = mmr_dynamic_select(scored)
 
@@ -2328,6 +2349,7 @@ def run():
             conn, week, all_ent_counts, top, bank,
         )
 
+        print("digest [8/12] updating topic bank")
         # Commit topic-bank state from the selected top clusters, then persist
         # this week's per-cluster signal vectors (keyed by topic_id) for A5
         # retrospective tuning.
@@ -2337,11 +2359,13 @@ def run():
 
         macro_context = load_macro_context(conn)
         history_depth = "full" if history_weeks >= 10 else "warmup"
+        print(f"digest [9/12] LLM summarise ({len(top)} clusters, history={history_depth})")
         summary, cluster_index = summarise(
             top, items, macro_context, history_depth=history_depth,
             longitudinal_context=longitudinal_context,
         )
 
+        print("digest [10/12] saving digest state")
         save_digest(conn, top, items, summary, vec)
         save_entity_history(conn, dict(all_ent_counts), week)
 
@@ -2359,9 +2383,10 @@ def run():
             print(f"coverage render failed: {e}")
             coverage_html = None
         conn.close()
+
+        print("digest [11/12] pushing db + publishing static site")
         push_db()
 
-        send_email(render_email(summary, cluster_index, top, items, display_macro))
         publish_static(
             render_static(summary, cluster_index, top, items, week,
                           display_macro, archive_links),
@@ -2369,6 +2394,9 @@ def run():
         )
         if coverage_html:
             publish_coverage(coverage_html, week)
+
+        print("digest [12/12] sending email")
+        send_email(render_email(summary, cluster_index, top, items, display_macro))
 
         # Monthly self-learning metrics email — only on the first Sunday of the
         # month. Re-open the DB read-only since we already closed/pushed above;

@@ -177,6 +177,7 @@ def _extract_body(html):
 
 
 def scrape_newsroom(source, index_url, session, known_urls):
+    print(f"newsroom {source}: fetching index")
     html = _get(session, index_url)
     if not html:
         print(f"newsroom_skip {source}: index fetch failed")
@@ -195,19 +196,22 @@ def scrape_newsroom(source, index_url, session, known_urls):
         return []
 
     new_links = [(t, u) for t, u in links if u not in known_urls][:6]
+    print(f"newsroom {source}: {len(links)} found, {len(new_links)} new")
     rows = []
-    for title, url in new_links:
+    n_new = len(new_links)
+    for j, (title, url) in enumerate(new_links, 1):
+        print(f"  [{j}/{n_new}] {source}: {title[:60]}")
         time.sleep(DELAY)
         body_html = _get(session, url)
         body = _extract_body(body_html)[:4000] if body_html else ""
         rows.append((item_id(source, url), source, title, url, body, now_iso(), now_iso()))
 
-    print(f"newsroom {source}: {len(links)} found, {len(new_links)} new")
     return rows
 
 
 def run():
     with pipeline_lock():
+        print("newsroom ingest: pulling db")
         conn = pull_db()
 
         newsroom_sources = tuple({s for s, _ in NEWSROOMS})
@@ -221,8 +225,10 @@ def run():
 
         session = _session()
         all_rows = []
+        total = len(NEWSROOMS)
 
-        for source, index_url in NEWSROOMS:
+        for i, (source, index_url) in enumerate(NEWSROOMS, 1):
+            print(f"[{i}/{total}] newsroom {source}")
             try:
                 rows = scrape_newsroom(source, index_url, session, known)
                 all_rows.extend(rows)
@@ -231,6 +237,7 @@ def run():
                 print(f"newsroom_error {source}: {e}")
             time.sleep(DELAY)
 
+        print(f"newsroom: committing {len(all_rows)} rows")
         before = conn.total_changes
         conn.executemany(
             "INSERT OR IGNORE INTO items(id,source,title,url,body,ts,ingested_at) VALUES(?,?,?,?,?,?,?)",
@@ -239,6 +246,7 @@ def run():
         conn.commit()
         inserted = conn.total_changes - before
         conn.close()
+        print("newsroom: pushing db")
         push_db()
         print(f"newsroom total seen={len(all_rows)} inserted={inserted}")
 

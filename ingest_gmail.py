@@ -89,10 +89,15 @@ def run():
         print(f"gmail_skip: credentials unavailable ({e})")
         return
     with pipeline_lock():
+        print("gmail ingest: pulling db")
         svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
         conn = pull_db()
         rows = []
-        for m in list_messages(svc):
+        messages = list_messages(svc)
+        total = len(messages)
+        print(f"gmail: {total} messages to process")
+        for i, m in enumerate(messages, 1):
+            print(f"[{i}/{total}] gmail message {m['id']}")
             msg = svc.users().messages().get(userId="me", id=m["id"], format="full").execute()
             headers = {h["name"].lower(): h["value"] for h in msg["payload"].get("headers", [])}
             source = classify_source(headers.get("from", ""))
@@ -110,6 +115,7 @@ def run():
         conn.commit()
         inserted = conn.total_changes - before
         conn.close()
+        print("gmail: pushing db")
         push_db()
         print(f"gmail seen={len(rows)} inserted={inserted}")
 

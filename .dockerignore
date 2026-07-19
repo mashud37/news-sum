@@ -23,10 +23,6 @@ __pycache__/
 env.yaml
 *.token.json
 
-# Local-only Streamlit dashboards launched via manage.py. Never run in
-# Cloud Run; their deps (streamlit, pandas) would only bloat the image.
-dashboards/
-
 # VCS metadata (defensive — repo is not currently git-tracked)
 .git/
 .gitignore

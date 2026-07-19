@@ -39,9 +39,12 @@ def fetch(url, etag, last_modified):
 
 def run():
     with pipeline_lock():
+        print("rss ingest: pulling db")
         conn = pull_db()
         rows = []
-        for source, url in FEEDS:
+        total = len(FEEDS)
+        for i, (source, url) in enumerate(FEEDS, 1):
+            print(f"[{i}/{total}] rss {source}")
             etag, lm = load_cache(conn, url)
             try:
                 feed = fetch(url, etag, lm)
@@ -63,6 +66,7 @@ def run():
                 rows.append((item_id(source, link), source, title, link, body[:4000], ts, now_iso()))
             save_cache(conn, url, getattr(feed, "etag", None), getattr(feed, "modified", None))
 
+        print(f"rss: committing {len(rows)} rows")
         before = conn.total_changes
         conn.executemany(
             "INSERT OR IGNORE INTO items(id,source,title,url,body,ts,ingested_at) VALUES(?,?,?,?,?,?,?)",
@@ -71,6 +75,7 @@ def run():
         conn.commit()
         inserted = conn.total_changes - before
         conn.close()
+        print("rss: pushing db")
         push_db()
         print(f"rss seen={len(rows)} inserted={inserted}")
 

@@ -1,5 +1,0 @@
-# Local-only — never installed into the Cloud Run image. The dashboards run
-# on your machine, launched by manage.py. Pin loosely; the dashboards don't
-# care which patch release is installed.
-streamlit>=1.36,<2
-pandas>=2.0,<3
