@@ -1,175 +1,128 @@
 # news-sum
 
-Weekly media-industry intelligence digest, self-learning on the content stream — no clicks, no likes, no user signals.
+news-sum exists because keeping up with media-industry news by hand does not scale: dozens of feeds, newsletters, and newsrooms all publish the same handful of stories in different words, and a human reader wants the recurring ones surfaced, not buried under daily noise. The job ingests RSS feeds, Gmail newsletters, and scraped corporate newsrooms, clusters and dedups the results, scores them on eleven normalised signals that reward discourse coverage over a single reading window (not trending novelty or click-through), and emails a weekly digest while publishing the same content as a static page. A persistent topic bank tracks how long each story has been running so week-three coverage reads as "third consecutive week" rather than a fresh item, and a logistic regressor nudges the scoring weights once enough history accumulates.
 
----
+## Data flow
 
-## 1. About
+```mermaid
+flowchart TD
+    SCHED[/"Cloud Scheduler<br/>4 cron triggers"/] --> RSS["news-ingest-rss<br/>daily 07:00<br/>38 RSS feeds"]
+    SCHED --> GMAIL["news-ingest-gmail<br/>daily 08:00<br/>Gmail OAuth"]
+    SCHED --> NEWSROOM["news-ingest-newsroom<br/>Mon 09:00<br/>24 scraped sites"]
+    SCHED --> DIGEST["news-weekly-digest<br/>Sun 08:00"]
 
-Four Cloud Run Jobs ingest 38 RSS feeds, Gmail newsletters, and 24 corporate newsrooms (entertainment, ad-tech, martech, platforms, agencies, EU/LATAM/APAC press). A weekly job clusters, dedups, scores, and summarises the result, then emails a digest and publishes a public static page.
+    RSS --> DB[("state/pipeline.db<br/>GCS state bucket")]
+    GMAIL --> DB
+    NEWSROOM --> DB
 
-Scoring is a linear combination of 11 normalised signals (coverage, relevance, novelty, recency, persistence, source breadth, entity signal, trend velocity, richness, coverage gap, prior). A persistent topic bank tracks `first_week / last_week / weeks_seen / mass` across runs so multi-week stories earn visibility, and a logistic regressor nudges the weights once ≥10 weeks of history accumulate. Editorial spotlights are LLM-picked per `(sector, category)`; a longitudinal context block lets the LLM phrase "third consecutive week" / "returns after 4-week gap" from real history.
+    DB --> ENRICH["Enrich (SpaCy NER)"]
+    ENRICH --> CLUSTER["Two-lane clustering<br/>(TF-IDF agglomerative)"]
+    CLUSTER --> SCORE["11-factor scoring<br/>+ MMR selection"]
+    SCORE --> BANK["Topic bank update<br/>(persistence + dormancy)"]
+    BANK --> LLM["Editorial spotlight<br/>(Claude Haiku 4.5)"]
+    LLM --> DB
 
-Optimised for **discourse coverage over a single user's reading window** — not for trending novelty, not for click-through. A topic that recurs across weeks should be more visible, not less.
+    LLM --> EMAIL[/"Digest email (SMTP)"/]
+    LLM --> SITE[("digest.html<br/>public GCS site bucket")]
 
----
-
-## 2. Architecture & flow
-
-```
-Cloud Scheduler (4 cron triggers)
-  |
-  +-- news-ingest-rss      (daily 07:00 Berlin)   -- 38 RSS feeds
-  +-- news-ingest-gmail    (daily 08:00 Berlin)   -- Gmail newsletters (OAuth)
-  +-- news-ingest-newsroom (Mon  09:00 Berlin)    -- 24 scraped newsrooms
-  +-- news-weekly-digest   (Sun  08:00 Berlin)
-            |
-            +-- enrich (SpaCy NER)
-            +-- two-lane clustering (TF-IDF average-linkage agglomerative, title+body and title-only)
-            +-- 11-factor scoring  -->  MMR dynamic selection (score-knee)
-            +-- topic bank update (persistence + dormancy)
-            +-- LLM spotlight per (sector, category)   [Claude Haiku 4.5]
-            +-- publish:
-                  email (SMTP)
-                  static page (public GCS bucket, digest.html)
+    classDef store fill:#e8f0fe,stroke:#4285f4,color:#1a1a1a;
+    classDef trigger fill:#e6f4ea,stroke:#34a853,color:#1a1a1a;
+    class DB,SITE store;
+    class SCHED,EMAIL trigger;
 ```
 
-User flow:
+## Layout
 
-1. Sunday 08:00 — digest arrives in inbox; same content lives at `https://storage.googleapis.com/YOUR_PROJECT-news-site/digest.html`.
-2. Each sector renders an **editorial spotlight** (LLM-picked top stories per category with 1–3 sentence summaries and nested source links), then a visual separator, then an **all-stories dump** grouped by category in descending score order.
-3. Macro-trends section appears monthly with multi-week structural synthesis.
-4. The archive sidebar links to every prior week's stamped digest.
+```
+common.py           schema, USER_PROFILE, SOURCE_PRIORS, FEEDS
+digest.py           pipeline: enrich, cluster, score, spotlight, render
+evaluate.py         coverage ledger and adaptive weight tuning
+ingest_rss.py       RSS ingestion (38 feeds)
+ingest_gmail.py     Gmail newsletter ingestion (OAuth)
+ingest_newsroom.py  corporate newsroom scraper (24 sites)
+metrics_email.py    internal metrics email
+export_db.py        downloads and exports the SQLite DB
+Dockerfile          single image, entrypoint chosen by JOB env var
+deploy.sh           one-shot standalone deploy script
+gcloud_app.yaml     manifest read by the shared ../manage.py orchestrator
+```
 
-Persistence layout:
+## Setup
 
-| GCS path | Contents |
-|---|---|
-| `state/pipeline.db` | SQLite: items, digests, entity_history, topic_bank, cluster_signals, scorer_weights, profile_aspects/exclusions, coverage_ledger, macro_trends |
-| `state/pipeline.lock` | Distributed mutex (30-min TTL, auto-evicted) |
-| `digest.html` + archive copies | Public bucket — current and historical digests |
-
-Source files: [common.py](common.py) (schema + USER_PROFILE + SOURCE_PRIORS), [digest.py](digest.py) (pipeline + scoring + LLM + render), [evaluate.py](evaluate.py) (coverage ledger + adaptive weight tuning), [ingest_rss.py](ingest_rss.py), [ingest_gmail.py](ingest_gmail.py), [ingest_newsroom.py](ingest_newsroom.py), [export_db.py](export_db.py).
-
----
-
-## 3. Installation
-
-All commands assume `gcloud` is installed and a personal Gmail account with 2FA enabled (for the App Password).
-
-**1. Create the project and authenticate.**
 ```bash
 gcloud auth login
 gcloud projects create YOUR_PROJECT --name="News Digest"
 gcloud config set project YOUR_PROJECT
-# Link billing via console.cloud.google.com/billing
 ```
 
-**2. Enable APIs.**
-```bash
-gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
-  cloudscheduler.googleapis.com storage.googleapis.com \
-  artifactregistry.googleapis.com secretmanager.googleapis.com
-```
+Create the two buckets (state private, site public) and the required secrets, then deploy:
 
-**3. Create two buckets — state (private) and site (public).**
 ```bash
 gcloud storage buckets create gs://YOUR_PROJECT-news-state --location=europe-west1
-gcloud storage buckets create gs://YOUR_PROJECT-news-site  --location=europe-west1
+gcloud storage buckets create gs://YOUR_PROJECT-news-site --location=europe-west1
 gcloud storage buckets add-iam-policy-binding gs://YOUR_PROJECT-news-site \
   --member=allUsers --role=roles/storage.objectViewer
+
+printf "sk-ant-..." > tmp && gcloud secrets create news-anthropic-key --data-file=tmp && rm tmp
+printf "app-password" > tmp && gcloud secrets create news-smtp-pass --data-file=tmp && rm tmp
+# Gmail OAuth is optional; skip to disable Gmail ingest
+gcloud secrets create news-gmail-oauth-token --data-file=token.json
+
+bash deploy.sh   # edit PROJECT, REGION, SMTP_USER, DIGEST_TO at the top first
 ```
 
-**4. Create three secrets.** The Anthropic key is required; Gmail OAuth is optional (skip to disable Gmail ingest).
+The Gmail OAuth token is produced once with a short local script using `InstalledAppFlow` from `google_auth_oauthlib`, scoped to `gmail.readonly`, then dumped to `token.json` and uploaded as the secret above.
+
+Verify with:
+
 ```bash
-printf "sk-ant-..."             > tmp && gcloud secrets create news-anthropic-key   --data-file=tmp && rm tmp
-printf "abcdefghijklmnop"       > tmp && gcloud secrets create news-smtp-pass       --data-file=tmp && rm tmp
-gcloud secrets create news-gmail-oauth-token --data-file=token.json    # optional; see oauth_init.py snippet below
+gcloud run jobs execute news-ingest-rss --region=europe-west1 --wait
 ```
 
-To produce `token.json` once, run:
-```python
-# oauth_init.py — discard after secret upload
-from google_auth_oauthlib.flow import InstalledAppFlow
-import json
-creds = InstalledAppFlow.from_client_secrets_file(
-    "credentials.json",
-    scopes=["https://www.googleapis.com/auth/gmail.readonly"],
-).run_local_server(port=0)
-json.dump(json.loads(creds.to_json()), open("token.json", "w"))
-```
+## Commands
 
-**5. Build the image and create the four jobs.** `deploy.sh` does this in one shot from Cloud Shell or Git Bash; the manifest [gcloud_app.yaml](gcloud_app.yaml) is the source of truth for the same shape via the workspace orchestrator.
-```bash
-bash deploy.sh        # edit PROJECT, REGION, SMTP_USER, DIGEST_TO at the top first
-```
+| Action | Command |
+|---|---|
+| Deploy or update all four jobs | `bash deploy.sh` |
+| Deploy via the shared orchestrator | `python ../manage.py` |
+| Rebuild the image only | `gcloud builds submit --tag europe-west1-docker.pkg.dev/YOUR_PROJECT/news/app:latest .` |
+| Update one job to the latest image | `gcloud run jobs update news-weekly-digest --image=europe-west1-docker.pkg.dev/YOUR_PROJECT/news/app:latest --region=europe-west1` |
+| Trigger a job manually | `gcloud run jobs execute news-weekly-digest --region=europe-west1 --wait` |
+| Tail logs for a job | `gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=news-weekly-digest" --limit=50 --format="table(timestamp, textPayload)"` |
+| Download and export the SQLite DB | `python export_db.py --bucket YOUR_PROJECT-news-state --csv articles.csv --json articles.json` |
+| Force-clear a stuck lock | `gcloud storage rm gs://YOUR_PROJECT-news-state/state/pipeline.lock` |
 
-**6. Verify.**
-```bash
-gcloud run jobs execute news-ingest-rss      --region=europe-west1 --wait
-gcloud run jobs execute news-weekly-digest   --region=europe-west1 --wait
-```
+## Operations
 
-The digest job needs ≥1 ingest run to have content. After the first weekly run, `digest.html` is live in the public bucket.
+**Redeploy after a code change** runs the same `bash deploy.sh`, or the two-command rebuild-then-update sequence above for a single job.
 
----
+**Customising the pipeline.** `USER_PROFILE` (a BM25 relevance query), `KEY_ENTITIES` (entities that get a 2x signal boost), `SOURCE_PRIORS` (all 1.0 by default, letting persistence learn source quality), and `FEEDS` all live in `common.py`. `DEFAULT_WEIGHTS` (the eleven score-term weights) and `RELEVANCE_FLOOR` are at the top of `digest.py`.
 
-## 4. Cost
+**Common failures.**
+
+- Lock not released: `pipeline.lock` auto-evicts after 30 minutes; force-clear it with the command above if a run needs to proceed sooner.
+- "Too few items" on the first digest: ingest needs several runs to accumulate content; re-execute the three ingest jobs, then re-run the digest.
+- Digest email not received: `SMTP_PASS` must be the 16-character Gmail App Password with no spaces, on an account with 2FA enabled.
+- Static page returns 403: re-run the public IAM grant from Setup on the site bucket.
+- SpaCy model missing: the image build downloads `en_core_web_sm`; if the error fires, rebuild the image.
+
+## Cost
 
 Pricing assumes no free-tier credits. Cloud Run: $0.000024/vCPU-s, $0.0000025/GiB-s. Claude Haiku 4.5: $0.80/MTok in, $4.00/MTok out.
 
 | Resource | Schedule | Runtime | Monthly |
 |---|---|---|---|
-| ingest-rss | daily 07:00 | ~3 min × 1 vCPU / 1 GiB | $0.14 |
-| ingest-gmail | daily 08:00 | ~2 min × 1 vCPU / 1 GiB | $0.10 |
-| ingest-newsroom | weekly Mon | ~10 min × 1 vCPU / 1 GiB | $0.06 |
-| weekly-digest | weekly Sun | ~20 min × 2 vCPU / 2 GiB | $0.25 |
-| Cloud Scheduler (4 jobs) | — | — | $0.40 |
-| Artifact Registry (~1 GB) | — | — | $0.10 |
-| Cloud Build (monthly rebuild) | on deploy | — | $0.02 |
-| Cloud Storage (DB + HTML) | — | ~15 MB | $0.01 |
-| Claude Haiku (digest + macro) | 4–5 runs | ~20K in / 1.5K out | $0.06 |
+| ingest-rss | daily 07:00 | ~3 min x 1 vCPU / 1 GiB | $0.14 |
+| ingest-gmail | daily 08:00 | ~2 min x 1 vCPU / 1 GiB | $0.10 |
+| ingest-newsroom | weekly Mon | ~10 min x 1 vCPU / 1 GiB | $0.06 |
+| weekly-digest | weekly Sun | ~20 min x 2 vCPU / 2 GiB | $0.25 |
+| Cloud Scheduler (4 jobs) | | | $0.40 |
+| Artifact Registry (~1 GB) | | | $0.10 |
+| Cloud Build (on deploy) | | | $0.02 |
+| Cloud Storage (DB + HTML, ~15 MB) | | | $0.01 |
+| Claude Haiku (digest + macro), 4-5 runs, ~20K in / 1.5K out | | | $0.06 |
 | **Total** | | | **~$1.14/month** |
 
-Cost controls: jobs scale to zero between runs; RSS HTTP caching (ETag/Last-Modified) skips unchanged feeds; MMR caps LLM input at the score-knee regardless of corpus size; newsroom scraping is weekly with a 2-second crawl delay.
+> Estimates only, verify current pricing in the Google Cloud and Anthropic consoles before relying on them.
 
----
-
-## 5. Operations
-
-**Redeploy after a code change.**
-```bash
-bash deploy.sh
-# or, for a single job:
-gcloud builds submit --tag europe-west1-docker.pkg.dev/YOUR_PROJECT/news/app:latest .
-gcloud run jobs update news-weekly-digest --image=europe-west1-docker.pkg.dev/YOUR_PROJECT/news/app:latest --region=europe-west1
-```
-
-**Trigger a job manually.**
-```bash
-gcloud run jobs execute news-weekly-digest --region=europe-west1 --wait
-```
-
-**Tail logs.**
-```bash
-gcloud logging read \
-  "resource.type=cloud_run_job AND resource.labels.job_name=news-weekly-digest" \
-  --limit=50 --format="table(timestamp, textPayload)"
-```
-
-**Download the SQLite DB and export articles.** Writes to `~/news-sum-pipeline.db` by default, outside any OneDrive folder.
-```bash
-pip install google-cloud-storage
-gcloud auth application-default login
-python export_db.py --bucket YOUR_PROJECT-news-state --csv articles.csv --json articles.json
-```
-
-**Customise the pipeline.** `USER_PROFILE` (BM25 query for relevance), `KEY_ENTITIES` (2× entity-signal boost), `SOURCE_PRIORS` (all 1.0 by default — let persistence learn quality), and `FEEDS` (the source list) all live in [common.py](common.py). `DEFAULT_WEIGHTS` (the 11 score-term weights) and `RELEVANCE_FLOOR` are at the top of [digest.py](digest.py).
-
-**Common failures.**
-
-- *Lock not released.* `pipeline.lock` auto-evicts after 30 min; force-clear with `gcloud storage rm gs://YOUR_PROJECT-news-state/state/pipeline.lock`.
-- *"Too few items" on first digest.* Ingest needs several runs to accumulate; re-execute the three ingest jobs and re-run the digest.
-- *Digest email not received.* `SMTP_PASS` must be the 16-character Gmail App Password, no spaces, on an account with 2FA. Test: `python -c "import smtplib; s=smtplib.SMTP_SSL('smtp.gmail.com',465); s.login('you@gmail.com','app-password'); print('ok'); s.quit()"`.
-- *Static page 403.* Re-run the public IAM grant in step 3.
-- *SpaCy model missing.* Image build downloads `en_core_web_sm`. If the error fires, rebuild with `gcloud builds submit --tag ... .`.
+Cost controls: jobs scale to zero between runs, RSS ingestion uses HTTP caching (ETag/Last-Modified) to skip unchanged feeds, MMR caps the LLM's input at the score-knee regardless of corpus size, and newsroom scraping runs weekly with a polite crawl delay.
