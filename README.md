@@ -98,6 +98,8 @@ gcloud run jobs execute news-ingest-rss --region=europe-west1 --wait
 
 **Customising the pipeline.** `USER_PROFILE` (a BM25 relevance query), `KEY_ENTITIES` (entities that get a 2x signal boost), `SOURCE_PRIORS` (all 1.0 by default, letting persistence learn source quality), and `FEEDS` all live in `common.py`. `DEFAULT_WEIGHTS` (the eleven score-term weights) and `RELEVANCE_FLOOR` are at the top of `digest.py`.
 
+**Reading the coverage report.** Every metric `evaluate.py` reports is a content-derived proxy, not user-validated quality. The one semi-objective anchor is persistence-prediction AUC: whether the scorer's output predicted which topics actually recurred. Treat the rest as supporting indicators.
+
 **Common failures.**
 
 - Lock not released: `pipeline.lock` auto-evicts after 30 minutes; force-clear it with the command above if a run needs to proceed sooner.

@@ -9,71 +9,101 @@ from common import pull_db, push_db, item_id, now_iso, pipeline_lock
 UA = "Mozilla/5.0 (compatible; news-pipeline/1.0; +personal digest)"
 TIMEOUT = 20
 DELAY = 2.0  # polite crawl delay
+MAX_EXTRACTED_LINKS = 14
+NEXTJS_TITLE_MIN = 20
+NEXTJS_TITLE_MAX = 350
 
 NEWSROOMS = [
-    # ── major studio / broadcaster newsrooms ──────────────────────────────────
+    # ---- major studio / broadcaster newsrooms ----
     ("netflix",      "https://about.netflix.com/en/news"),
     ("wbd",          "https://wbd.com/news/"),
     ("nbcuniversal", "https://www.nbcuniversal.com/press-releases"),
     ("paramount",    "https://www.paramount.com/press-releases"),
     ("comcast",      "https://corporate.comcast.com/news-information"),
-    # ── social platform newsrooms ─────────────────────────────────────────────
+    # ---- social platform newsrooms ----
     ("snap",         "https://newsroom.snap.com"),
     ("tiktok",       "https://newsroom.tiktok.com/en-us"),
     ("amazon",       "https://www.aboutamazon.com/news"),
-    # ── industry body ─────────────────────────────────────────────────────────
+    # ---- industry body ----
     ("iab",          "https://www.iab.com/news/"),
-    # ── global agency holding groups ──────────────────────────────────────────
+    # ---- global agency holding groups ----
     ("wpp",          "https://www.wpp.com/en/news"),
     ("publicis",     "https://www.publicisgroupe.com/en/news"),
     ("omnicom",      "https://www.omnicomgroup.com/newsroom"),
     ("dentsu",       "https://www.dentsu.com/news"),
     ("ipg",          "https://www.interpublic.com/news"),
     ("havas",        "https://www.havas.com/en/news"),
-    # ── EU / UK broadcasters & media groups ───────────────────────────────────
+    # ---- EU / UK broadcasters & media groups ----
     ("bertelsmann",  "https://www.bertelsmann.de/en/news-and-media/news/"),
     ("sky",          "https://www.skygroup.sky/media-centre"),
     ("rtlgroup",     "https://www.rtlgroup.com/en/press/news.html"),
-    # ── East Asia ─────────────────────────────────────────────────────────────
+    # ---- East Asia ----
     ("bytedance",    "https://www.bytedance.com/en/news/"),
     ("tencent",      "https://www.tencent.com/en-us/investors/newsroom.html"),
     ("sony",         "https://www.sony.com/en/SonyInfo/News/"),
     ("kakao",        "https://www.kakaocorp.com/page/en/media/all"),
-    # ── South Asia (India) ────────────────────────────────────────────────────
+    # ---- South Asia (India) ----
     ("jio",          "https://www.jio.com/en-in/press-release"),
     ("zee",          "https://www.zeel.com/media-room/press-releases/"),
 ]
 
 _SKIP = frozenset([
-    "#", "javascript:", "mailto:", "tel:",
-    "/tag/", "/category/", "/author/", "/page/", "?page=",
-    "/rss", "/feed", "/sitemap", "/privacy", "/terms",
-    "/careers", "/jobs/", "/job/", "/apply", "/contact",
-    "/about", "/subscribe", "/login", "/register", "/search",
+    "#",
+    "javascript:",
+    "mailto:",
+    "tel:",
+    "/tag/",
+    "/category/",
+    "/author/",
+    "/page/",
+    "?page=",
+    "/rss",
+    "/feed",
+    "/sitemap",
+    "/privacy",
+    "/terms",
+    "/careers",
+    "/jobs/",
+    "/job/",
+    "/apply",
+    "/contact",
+    "/about",
+    "/subscribe",
+    "/login",
+    "/register",
+    "/search",
 ])
 
 _ARTICLE_HINTS = frozenset([
-    "/news/", "/press/", "/press-release/", "/article/", "/blog/",
-    "/newsroom/", "/announcement/", "/story/", "/post/", "/release/",
-    "/en-us/", "/en/",
+    "/news/",
+    "/press/",
+    "/press-release/",
+    "/article/",
+    "/blog/",
+    "/newsroom/",
+    "/announcement/",
+    "/story/",
+    "/post/",
+    "/release/",
+    "/en-us/",
+    "/en/",
 ])
 
 _BODY_SELECTORS = [
-    "article", "main", "[role='main']",
-    ".post-content", ".entry-content", ".article-body", ".article__body",
-    ".content-body", ".story-body", ".press-release-body",
-    ".page-content", ".main-content", "#content",
+    "article",
+    "main",
+    "[role='main']",
+    ".post-content",
+    ".entry-content",
+    ".article-body",
+    ".article__body",
+    ".content-body",
+    ".story-body",
+    ".press-release-body",
+    ".page-content",
+    ".main-content",
+    "#content",
 ]
-
-
-def _session():
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": UA,
-        "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
-        "Accept-Language": "en-US,en;q=0.9",
-    })
-    return s
 
 
 def _get(session, url):
@@ -89,7 +119,7 @@ def _apex(netloc):
     return ".".join(parts[-2:]) if len(parts) >= 2 else netloc
 
 
-def _extract_links(html, base_url, max_links=14):
+def _extract_links(html, base_url, max_links=MAX_EXTRACTED_LINKS):
     base = urlparse(base_url)
     base_apex = _apex(base.netloc)
     tree = HTMLParser(html)
@@ -108,7 +138,7 @@ def _extract_links(html, base_url, max_links=14):
         abs_url = urljoin(base_url, href).split("?")[0].rstrip("/")
         parsed = urlparse(abs_url)
 
-        # same apex domain — allows subdomains like about.netflix.com
+        # same apex domain, allows subdomains like about.netflix.com
         if _apex(parsed.netloc) != base_apex:
             continue
         norm_base = base.path.rstrip("/")
@@ -126,6 +156,35 @@ def _extract_links(html, base_url, max_links=14):
     return [(text, url) for _, _, text, url in candidates[:max_links]]
 
 
+def _nextjs_link(obj):
+    """Return the title and url when this node looks like a link, else None."""
+    url = (obj.get("url") or obj.get("href") or obj.get("slug") or
+           obj.get("link") or "")
+    title = (obj.get("title") or obj.get("headline") or
+             obj.get("name") or obj.get("displayTitle") or "")
+    if not url or not title:
+        return None
+    if not NEXTJS_TITLE_MIN <= len(str(title)) <= NEXTJS_TITLE_MAX:
+        return None
+    return {"title": str(title).strip(), "url": str(url)}
+
+
+def _walk_nextjs_node(obj, depth, results):
+    if depth > 9 or len(results) >= 14:
+        return
+    if isinstance(obj, list):
+        for item in obj:
+            _walk_nextjs_node(item, depth + 1, results)
+    elif isinstance(obj, dict):
+        link = _nextjs_link(obj)
+        if link:
+            results.append((link["title"], link["url"]))
+            return
+        for value in obj.values():
+            if isinstance(value, (dict, list)):
+                _walk_nextjs_node(value, depth + 1, results)
+
+
 def _extract_nextjs_links(html):
     m = re.search(
         r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
@@ -139,26 +198,7 @@ def _extract_nextjs_links(html):
         return []
 
     results = []
-
-    def walk(obj, depth=0):
-        if depth > 9 or len(results) >= 14:
-            return
-        if isinstance(obj, list):
-            for item in obj:
-                walk(item, depth + 1)
-        elif isinstance(obj, dict):
-            url = (obj.get("url") or obj.get("href") or obj.get("slug") or
-                   obj.get("link") or "")
-            title = (obj.get("title") or obj.get("headline") or
-                     obj.get("name") or obj.get("displayTitle") or "")
-            if url and title and 20 <= len(str(title)) <= 350:
-                results.append((str(title).strip(), str(url)))
-            else:
-                for v in obj.values():
-                    if isinstance(v, (dict, list)):
-                        walk(v, depth + 1)
-
-    walk(data)
+    _walk_nextjs_node(data, 0, results)
     return results
 
 
@@ -223,7 +263,12 @@ def run():
             )
         }
 
-        session = _session()
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
         all_rows = []
         total = len(NEWSROOMS)
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# deploy.sh — full one-shot deployment for the media intelligence pipeline
+# deploy.sh: full one-shot deployment for the media intelligence pipeline
 # Usage: edit the variables below, then: bash deploy.sh
 #
 # NOTE: gcloud_app.yaml is the authoritative config (see ../GCLOUD_POLICY.md and
-#       ../manage.py). This script is the standalone fallback — keep it in sync.
+#       ../manage.py). This script is the standalone fallback, keep it in sync.
 
 set -euo pipefail
 
@@ -63,7 +63,7 @@ gcloud storage buckets update "gs://${SITE_BUCKET}" \
 # ── service account for Cloud Scheduler ──────────────────────────────────────
 SA="news-sa@${PROJECT}.iam.gserviceaccount.com"
 gcloud iam service-accounts create news-sa \
-  --display-name="News pipeline — Cloud Scheduler invoker" \
+  --display-name="News pipeline, Cloud Scheduler invoker" \
   --project="${PROJECT}" 2>/dev/null || true
 
 gcloud projects add-iam-policy-binding "${PROJECT}" \
@@ -112,7 +112,7 @@ gcloud run jobs update news-ingest-gmail \
   --set-secrets="GMAIL_OAUTH_TOKEN=news-gmail-oauth-token:latest" \
   --task-timeout=300s --memory=1Gi --region="${REGION}"
 
-# Newsroom scraper — runs once weekly (Mon 09:00 UTC); polite 2s crawl delay across 22 sites
+# Newsroom scraper, runs once weekly (Mon 09:00 UTC); polite 2s crawl delay across 22 sites
 gcloud run jobs create news-ingest-newsroom \
   --image="${IMAGE}" "${COMMON_FLAGS[@]}" \
   --set-env-vars="JOB=ingest_newsroom" \

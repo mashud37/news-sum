@@ -17,7 +17,7 @@ NEWSLETTER_SENDERS = {
     "digiday": ["digiday.com"],
     "adweek": ["adweek.com"],
     "morningbrew": ["morningbrew.com"],
-    # Publishers with no working public RSS — read via their email editions:
+    # Publishers with no working public RSS, read via their email editions:
     "lowpass": ["lowpass.cc"],
     "thedrum": ["thedrum.com"],
     "exchange4media": ["exchange4media.com", "e4mevents.com"],

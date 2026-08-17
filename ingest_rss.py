@@ -8,6 +8,7 @@ from common import (
 
 socket.setdefaulttimeout(15)
 UA = "news-pipeline/1.0 (+personal digest)"
+BODY_CHARS = 4000
 
 
 def clean_html(s):
@@ -37,6 +38,30 @@ def fetch(url, etag, last_modified):
     )
 
 
+def _rows_from_feed(feed, source):
+    """Turn one parsed feed into insertable item rows, skipping untitled entries."""
+    rows = []
+    for entry in feed.entries:
+        link = (entry.get("link") or "").split("?")[0]
+        title = (entry.get("title") or "").strip()
+        if not link or not title:
+            continue
+        body = clean_html(entry.get("summary", "")) or clean_html(
+            (entry.get("content") or [{}])[0].get("value", "")
+        )
+        ts = entry.get("published") or entry.get("updated") or now_iso()
+        rows.append((
+            item_id(source, link),
+            source,
+            title,
+            link,
+            body[:BODY_CHARS],
+            ts,
+            now_iso(),
+        ))
+    return rows
+
+
 def run():
     with pipeline_lock():
         print("rss ingest: pulling db")
@@ -54,16 +79,7 @@ def run():
             if getattr(feed, "status", 200) == 304:
                 save_cache(conn, url, etag, lm)
                 continue
-            for e in feed.entries:
-                link = (e.get("link") or "").split("?")[0]
-                title = (e.get("title") or "").strip()
-                if not link or not title:
-                    continue
-                body = clean_html(e.get("summary", "")) or clean_html(
-                    (e.get("content") or [{}])[0].get("value", "")
-                )
-                ts = e.get("published") or e.get("updated") or now_iso()
-                rows.append((item_id(source, link), source, title, link, body[:4000], ts, now_iso()))
+            rows.extend(_rows_from_feed(feed, source))
             save_cache(conn, url, getattr(feed, "etag", None), getattr(feed, "modified", None))
 
         print(f"rss: committing {len(rows)} rows")

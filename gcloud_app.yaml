@@ -1,4 +1,4 @@
-# Standardized deployment manifest — see ../GCLOUD_POLICY.md
+# Standardized deployment manifest, see ../GCLOUD_POLICY.md
 # Source of truth for `python ../manage.py`. deploy.sh is the standalone fallback.
 app: news-sum
 prefix: news
@@ -11,7 +11,7 @@ artifact_registry:
 
 service_account:
   name: news-sa
-  display: "News pipeline — Cloud Scheduler invoker"
+  display: "News pipeline, Cloud Scheduler invoker"
   roles: [roles/run.invoker]
 
 uses_secrets: true

@@ -11,5 +11,6 @@ rank-bm25==0.2.2
 numpy==1.26.4
 anthropic>=0.45.0
 spacy>=3.7,<4
+click>=8.0,<9
 matplotlib==3.9.2
 sentence-transformers>=3.0,<4

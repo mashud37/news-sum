@@ -11,14 +11,14 @@ __pycache__/
 *.swp
 .DS_Store
 
-# Secrets — never commit. env.yaml here would only appear if a user runs the
+# Secrets, never commit. env.yaml here would only appear if a user runs the
 # job locally; the production secrets live in Secret Manager.
 .env
 env.yaml
 *.token.json
 credentials.json
 
-# Local pipeline state and exported article data — contain article text and
+# Local pipeline state and exported article data, contain article text and
 # may contain PII from email newsletters. Must never end up in git or in a
 # Docker build context (see .dockerignore for the same rules).
 pipeline.db

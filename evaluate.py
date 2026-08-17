@@ -1,20 +1,5 @@
-#!/usr/bin/env python3
-"""Discourse coverage & understanding — internal proxy metrics.
-
-Read-only on the pipeline DB. Surfaces longitudinal indicators of how well the
-system is covering the discourse space defined by USER_PROFILE and how well it
-is modelling persistent topics over time.
-
-IMPORTANT: every metric here is a content-derived proxy, not user-validated
-quality. The single semi-objective anchor is persistence-prediction AUC: did the
-scorer's output predict which topics actually recurred. All others are
-supporting proxies.
-
-Entry points:
-    evaluate.report(conn, weeks=12) -> dict          # JSON-friendly time series
-    evaluate.render_html(report)    -> str           # standalone HTML page
-    evaluate.publish_coverage(html, week) -> None    # GCS upload (mirrors digest)
-    python evaluate.py [--weeks N] [--metric NAME] [--format text|json]
+"""Report read-only proxy metrics for discourse coverage and topic persistence
+over the pipeline database, as a time series and a rendered HTML page.
 """
 from __future__ import annotations
 
@@ -27,8 +12,17 @@ from datetime import datetime, timezone
 
 from common import pull_db
 
+# ---- Metric defaults ----
 
-# ── shared helpers ────────────────────────────────────────────────────────────
+EVAL_WEEKS_WINDOW = 12
+COVERAGE_THRESHOLD = 0.4
+DEBT_DECAY_RATE = 0.7
+DEBT_LOOKBACK_WEEKS = 6
+SPARKLINE_WIDTH = 160
+SPARKLINE_HEIGHT = 32
+
+
+# ---- Shared helpers ----
 
 INSUFFICIENT = lambda n: {"insufficient_history": True, "weeks_available": int(n)}
 
@@ -41,29 +35,21 @@ def _recent_weeks(conn, table, week_col, n):
     return [r[0] for r in rows][::-1]  # oldest -> newest
 
 
-def _gini(values):
-    """Standard Gini coefficient on non-negative values."""
-    vals = sorted(v for v in values if v is not None)
-    n = len(vals)
-    if n == 0 or sum(vals) == 0:
-        return 0.0
-    cum = 0.0
-    for i, v in enumerate(vals, 1):
-        cum += i * v
-    return (2 * cum) / (n * sum(vals)) - (n + 1) / n
-
-
 def _direction(series):
     """Return +1 / -1 / 0 comparing the latest value to the earliest."""
     items = [v for v in series.values() if isinstance(v, (int, float))]
     if len(items) < 2:
         return 0
-    return 1 if items[-1] > items[0] else (-1 if items[-1] < items[0] else 0)
+    if items[-1] > items[0]:
+        return 1
+    if items[-1] < items[0]:
+        return -1
+    return 0
 
 
-# ── metrics ──────────────────────────────────────────────────────────────────
+# ---- Metrics ----
 
-def coverage_completeness(conn, weeks=12, threshold=0.4):
+def coverage_completeness(conn, weeks=EVAL_WEEKS_WINDOW, threshold=COVERAGE_THRESHOLD):
     """Per week: fraction of profile aspects whose coverage exceeded the
     threshold. Up = the discourse space is being covered more fully.
 
@@ -83,7 +69,7 @@ def coverage_completeness(conn, weeks=12, threshold=0.4):
     return out
 
 
-def coverage_balance(conn, weeks=12):
+def coverage_balance(conn, weeks=EVAL_WEEKS_WINDOW):
     """Per week: 1 - Gini across aspect coverages. Up = more even spread,
     less fixation on loud aspects.
 
@@ -98,11 +84,39 @@ def coverage_balance(conn, weeks=12):
         ).fetchall()
         if not rows:
             continue
-        out[wk] = 1.0 - _gini([c for (c,) in rows])
+        vals = sorted(c for (c,) in rows if c is not None)
+        n = len(vals)
+        if n == 0 or sum(vals) == 0:
+            gini = 0.0
+        else:
+            cum = 0.0
+            for i, v in enumerate(vals, 1):
+                cum += i * v
+            gini = (2 * cum) / (n * sum(vals)) - (n + 1) / n
+        out[wk] = 1.0 - gini
     return out
 
 
-def coverage_debt_burndown(conn, weeks=12, decay=0.7, window=6, threshold=0.4):
+def _accumulated_debt(conn, aspects, recent, threshold, decay):
+    """Sum the decayed debt an aspect carries for every week it stayed uncovered."""
+    debt = 0.0
+    for age, week in enumerate(recent):
+        seen = dict(conn.execute(
+            "SELECT aspect, coverage FROM coverage_ledger WHERE week=?", (week,),
+        ).fetchall())
+        for aspect in aspects:
+            if seen.get(aspect, 0.0) < threshold:
+                debt += decay ** age
+    return debt
+
+
+def coverage_debt_burndown(
+    conn,
+    weeks=EVAL_WEEKS_WINDOW,
+    decay=DEBT_DECAY_RATE,
+    window=DEBT_LOOKBACK_WEEKS,
+    threshold=COVERAGE_THRESHOLD,
+):
     """Per week: total decayed debt across all aspects, looking back `window`
     weeks from each evaluation week. Down = the system is filling its gaps.
 
@@ -122,19 +136,11 @@ def coverage_debt_burndown(conn, weeks=12, decay=0.7, window=6, threshold=0.4):
         aspects = {a for (a,) in conn.execute(
             "SELECT DISTINCT aspect FROM coverage_ledger WHERE week<=?", (wk,),
         ).fetchall()}
-        debt = 0.0
-        for age, rwk in enumerate(recent):
-            seen = dict(conn.execute(
-                "SELECT aspect, coverage FROM coverage_ledger WHERE week=?", (rwk,),
-            ).fetchall())
-            for a in aspects:
-                if seen.get(a, 0.0) < threshold:
-                    debt += decay ** age
-        out[wk] = debt
+        out[wk] = _accumulated_debt(conn, aspects, recent, threshold, decay)
     return out
 
 
-def topic_model_maturity(conn, weeks=12):
+def topic_model_maturity(conn, weeks=EVAL_WEEKS_WINDOW):
     """From topic_bank: live topic count, mean weeks_seen, and churn (new+pruned
     per week, approximated as topics whose first_week == wk). A maturing model
     shows mean weeks_seen rising and churn falling.
@@ -162,7 +168,7 @@ def topic_model_maturity(conn, weeks=12):
     return out
 
 
-def novelty_recurrence_mix(conn, weeks=12):
+def novelty_recurrence_mix(conn, weeks=EVAL_WEEKS_WINDOW):
     """Per week: share of top clusters that were new / ongoing / resurfacing.
 
     Definition (recovered from cluster_signals + topic_bank):
@@ -202,7 +208,7 @@ def novelty_recurrence_mix(conn, weeks=12):
     return out
 
 
-def richness_trend(conn, weeks=12):
+def richness_trend(conn, weeks=EVAL_WEEKS_WINDOW):
     """Per week: mean cluster richness signal. Up = clusters carrying more
     substantive (entity-diverse, fact-rich) content on average.
 
@@ -221,7 +227,7 @@ def richness_trend(conn, weeks=12):
     return out
 
 
-def entity_vocabulary_growth(conn, weeks=12):
+def entity_vocabulary_growth(conn, weeks=EVAL_WEEKS_WINDOW):
     """Per week: distinct entities tracked cumulatively, plus the ratio of
     rare (high-IDF) to common (low-IDF) entities. Indicates the discourse
     model's resolving power.
@@ -249,14 +255,20 @@ def entity_vocabulary_growth(conn, weeks=12):
         rare = sum(1 for _, df in rows if df == 1)
         common_cutoff = max(2, math.ceil(weeks_so_far / 2))
         common = sum(1 for _, df in rows if df >= common_cutoff)
+        if common:
+            rare_to_common = rare / common
+        elif rare:
+            rare_to_common = float("inf")
+        else:
+            rare_to_common = 0.0
         out[wk] = {
             "distinct_entities": n_distinct,
-            "rare_to_common": (rare / common) if common else float("inf") if rare else 0.0,
+            "rare_to_common": rare_to_common,
         }
     return out
 
 
-def persistence_prediction_auc(conn, weeks=12):
+def persistence_prediction_auc(conn, weeks=EVAL_WEEKS_WINDOW):
     """Per week: rolling AUC of the scorer's score → topic persistence label.
 
     Persistence label is leak-free: a row at (week=wk, topic_id=t) "persisted"
@@ -320,7 +332,7 @@ def _roc_auc(scores, labels):
     return (rank_sum - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
 
 
-# ── report assembly ──────────────────────────────────────────────────────────
+# ---- Report assembly ----
 
 METRICS = [
     ("coverage_completeness", coverage_completeness,
@@ -342,10 +354,10 @@ METRICS = [
 ]
 
 
-def report(conn, weeks=12):
+def report(conn, weeks=EVAL_WEEKS_WINDOW):
     """Compute all metrics and return a JSON-friendly dict."""
     out = {
-        "header": "Discourse coverage & understanding — internal proxy metrics, "
+        "header": "Discourse coverage & understanding, internal proxy metrics, "
                   "not user-validated quality.",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "weeks_window": int(weeks),
@@ -363,7 +375,7 @@ def report(conn, weeks=12):
     return out
 
 
-# ── text rendering (CLI) ─────────────────────────────────────────────────────
+# ---- Text rendering (CLI) ----
 
 def _format_value(v):
     if isinstance(v, dict):
@@ -390,7 +402,7 @@ def render_text(rep):
         lines.append(f"## {name}")
         lines.append(f"   {interp}")
         if isinstance(series, dict) and series.get("insufficient_history"):
-            lines.append(f"   (insufficient history — {series['weeks_available']} weeks)")
+            lines.append(f"   (insufficient history, {series['weeks_available']} weeks)")
             lines.append("")
             continue
         if not isinstance(series, dict) or not series:
@@ -409,9 +421,9 @@ def render_text(rep):
     return "\n".join(lines)
 
 
-# ── HTML rendering ───────────────────────────────────────────────────────────
+# ---- HTML rendering ----
 
-def _sparkline(values, width=160, height=32):
+def _sparkline(values, width=SPARKLINE_WIDTH, height=SPARKLINE_HEIGHT):
     nums = [v for v in values if isinstance(v, (int, float)) and not math.isinf(v)]
     if len(nums) < 2:
         return f'<svg width="{width}" height="{height}"></svg>'
@@ -457,7 +469,12 @@ def _render_metric_block(name, series, interpretation):
         body = f'<table>{"".join(rows)}</table>'
     else:
         seq = [series[k] for k in ks]
-        direction = "↑" if last_val > first_val else ("↓" if last_val < first_val else "→")
+        if last_val > first_val:
+            direction = "↑"
+        elif last_val < first_val:
+            direction = "↓"
+        else:
+            direction = "→"
         body = (
             f'<div class="row">'
             f'<span class="v">{_short(last_val)}</span> '
@@ -516,7 +533,7 @@ footer{{margin-top:32px;color:#333;font-size:11px;text-align:center}}
 </html>"""
 
 
-# ── GCS publish ──────────────────────────────────────────────────────────────
+# ---- GCS publish ----
 
 def publish_coverage(html, week):
     """Upload coverage.html (+ a week-stamped archive copy) to GCS_SITE_BUCKET.
@@ -535,7 +552,7 @@ def publish_coverage(html, week):
     print(f"site: https://storage.googleapis.com/{site_bucket}/coverage.html")
 
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
+# ---- CLI ----
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -552,7 +569,7 @@ def main():
                 sys.exit(f"Unknown metric. Available: {[m[0] for m in METRICS]}")
             name, fn, interp = match[0]
             rep = {
-                "header": "Discourse coverage & understanding — internal proxy metrics, "
+                "header": "Discourse coverage & understanding, internal proxy metrics, "
                           "not user-validated quality.",
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "weeks_window": args.weeks,

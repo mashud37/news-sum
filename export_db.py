@@ -1,19 +1,5 @@
-#!/usr/bin/env python3
-"""Download the stored-article database from GCS and optionally export it.
-
-The whole pipeline lives in one SQLite file in the state bucket
-(state/pipeline.db). This pulls it down and, if asked, dumps the `items`
-table — every article ever ingested — to CSV and/or JSON.
-
-Examples (PowerShell):
-    # just fetch the raw SQLite file
-    $env:GCS_BUCKET = "your-project-news-state"; python export_db.py
-
-    # fetch + export the articles table
-    python export_db.py --bucket your-project-news-state `
-        --csv articles.csv --json articles.json
-
-Requires: pip install google-cloud-storage  (plus `gcloud auth application-default login`).
+"""Download the pipeline SQLite file from the state bucket and optionally export
+the `items` table to CSV or JSON.
 """
 import argparse
 import csv
@@ -26,7 +12,14 @@ from google.cloud import storage
 
 DB_BLOB = "state/pipeline.db"
 ITEM_COLUMNS = [
-    "id", "source", "title", "url", "body", "ts", "ingested_at", "used_in_digest",
+    "id",
+    "source",
+    "title",
+    "url",
+    "body",
+    "ts",
+    "ingested_at",
+    "used_in_digest",
 ]
 # Default local DB path lives outside the source tree (and outside OneDrive).
 DEFAULT_LOCAL_DB = os.path.join(os.path.expanduser("~"), "news-sum-pipeline.db")
@@ -53,7 +46,8 @@ def export_items(db_path: str, csv_path: str | None, json_path: str | None) -> N
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(ITEM_COLUMNS)
-            writer.writerows([r[c] for c in ITEM_COLUMNS] for r in rows)
+            for r in rows:
+                writer.writerow([r[c] for c in ITEM_COLUMNS])
         print(f"Wrote CSV  -> {csv_path}")
 
     if json_path:

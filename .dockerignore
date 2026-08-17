@@ -1,4 +1,4 @@
-# Local article data — must never end up in the image (PII, project state).
+# Local article data, must never end up in the image (PII, project state).
 pipeline.db
 pipeline.db-journal
 pipeline.db-wal
@@ -18,11 +18,11 @@ __pycache__/
 .idea/
 *.swp
 
-# Local env / credential files (defensive — see ../user_config.yaml)
+# Local env / credential files (defensive, see ../user_config.yaml)
 .env
 env.yaml
 *.token.json
 
-# VCS metadata (defensive — repo is not currently git-tracked)
+# VCS metadata (defensive, repo is not currently git-tracked)
 .git/
 .gitignore

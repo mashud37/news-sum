@@ -13,6 +13,7 @@ import scipy.sparse as sp
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+from functools import partial
 
 import spacy
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -30,6 +31,195 @@ from common import (
 
 EMBED_MODEL = "all-MiniLM-L6-v2"
 _EMBED_BODY_CHARS = 500
+
+_NER_LABELS = {"ORG", "PERSON", "GPE", "PRODUCT", "MONEY", "PERCENT", "DATE"}
+_ENTITY_SIGNAL_LABELS = {"ORG", "PERSON", "GPE", "PRODUCT"}
+_SPOTLIGHT_LABELS = {"ORG", "PERSON", "PRODUCT"}
+_SOURCE_NAMES = frozenset(k.lower() for k in SOURCE_SECTOR)
+
+# Default scorer weights (before any adaptive tuning).
+# Anchor invariant: USER_PROFILE defines the discourse space; the relevance term
+# (profile-BM25) is the link to that space and its weight is floored at
+# RELEVANCE_FLOOR so adaptive tuning can never let the system drift away from it.
+DEFAULT_WEIGHTS = {
+    "coverage":       0.14,
+    "prior":          0.07,
+    "novelty":        0.09,
+    "relevance":      0.20,
+    "entity_signal":  0.06,
+    "trend":          0.05,
+    "richness":       0.06,
+    "coverage_gap":   0.06,
+    "persistence":    0.10,
+    "source_breadth": 0.07,
+    "recency":        0.10,
+}
+RELEVANCE_FLOOR = 0.20
+DUMP_RELEVANCE_FLOOR = 0.12
+WEIGHT_KEYS = list(DEFAULT_WEIGHTS.keys())
+
+TFIDF_SIM_THRESHOLD = 0.20
+TITLE_SIM_THRESHOLD = 0.40
+MIN_DOCUMENT_FREQUENCY = 2
+SPARSE_DOCUMENT_FREQUENCY = 1
+MIN_ITEMS_FOR_DIGEST = 10
+FULL_HISTORY_WEEKS = 10
+COVERAGE_REPORT_WEEKS = 12
+
+STEP_PLAN = [
+    "Pull DB",
+    "Load & enrich items",
+    "Build TF-IDF + cluster",
+    "Embed items",
+    "Load discourse context",
+    "Score clusters",
+    "MMR select + dedup",
+    "Update topic bank",
+    "LLM summarise",
+    "Save digest state",
+    "Push DB + publish",
+    "Send email",
+]
+
+RRF_K = 60
+DORMANT_WEEKS = 4
+DORMANT_NOVELTY_BONUS = 0.3
+TOP_ENTITIES_PER_CLUSTER = 5
+TREND_CLIP_LOW = -1.0
+TREND_CLIP_HIGH = 3.0
+RECENCY_DECAY_DAYS = 4.0
+KEY_ENTITY_BOOST = 2
+
+SHINGLE_SIZE = 3
+MMR_SENTENCE_MAX_CHARS = 240
+MMR_SENTENCE_LAMBDA = 0.7
+CLUSTER_MAX_DIAMETER = 0.80
+ENTITY_HISTORY_WEEKS = 4
+COVERAGE_DEBT_DECAY = 0.7
+COVERAGE_DEBT_WINDOW = 6
+COVERAGE_DEBT_THRESHOLD = 0.4
+TOPIC_CENTROID_TOP_N = 200
+TOPIC_BANK_ALPHA = 0.7
+TOPIC_BANK_MATCH_THRESHOLD = 0.3
+TOPIC_BANK_DECAY = 0.8
+TOPIC_BANK_MASS_FLOOR = 0.05
+TOPIC_BANK_STALE_WEEKS = 12
+TUNE_MIN_WEEKS = 10
+TUNE_BLEND_CURRENT = 0.7
+TUNE_BLEND_LEARNED = 0.3
+LONGITUDINAL_STREAK_MIN = 3
+LONGITUDINAL_DORMANT_MIN = 4
+LONGITUDINAL_TOP_N = 5
+LONGITUDINAL_TOPIC_DISPLAY_MAX = 3
+MMR_SELECT_K = 15
+MMR_LAMBDA = 0.65
+MMR_MIN_K = 8
+MMR_MAX_K = 40
+MMR_RELEVANCE_FLOOR = 0.15
+OFF_PROFILE_RELEVANCE_FLOOR = 0.10
+OFF_PROFILE_PERSISTENCE_FLOOR = 0.15
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF_BASE = 2.0
+ARCHIVE_LINKS_COUNT = 8
+CLUSTER_LINKS_CAP = 5
+SECTION_DUMP_LINKS_CAP = 4
+
+SUMMARISE_SYSTEM_PROMPT = (
+    "You are a media industry researcher curating an editorial spotlight "
+    "for an audience of industry professionals and academics.\n\n"
+    "STRICT anti-patterns:\n"
+    "- Do NOT open with abstract claims about markets shifting, "
+    "industries transforming, or sectors evolving. Lead with the named "
+    "entity, deal, figure, or regulator.\n"
+    "- Do NOT invent streaks, returns, or multi-week patterns. Only "
+    "cite longitudinal context that is explicitly listed in the prompt.\n"
+    "- Do NOT reference a Cn that you did not pick, and do not "
+    "invent a Cn that does not appear in the source clusters.\n\n"
+    "Each pick: 1 to 3 sentences. Lead with the concrete observable, then "
+    "the structural implication. Cite companies and figures precisely. "
+    "No hedging. No filler."
+)
+
+SUMMARISE_BODY_PREAMBLE = (
+    "Below are clustered stories grouped by sector (## heading) and "
+    "category (### heading). Each cluster is numbered C{n} with its "
+    "score, source list, headline, body snippet, and top entities. "
+    "Clusters within each category are listed in descending score "
+    "order: the first is the highest-scoring.\n\n"
+    "For each (sector, category) you find meaningful, pick UP TO 5 "
+    "clusters to spotlight, ordered by your editorial judgement of "
+    "importance. Skip a category entirely if nothing rises above noise. "
+    "Skip a sector entirely if all its categories are skipped.\n\n"
+    "Output strictly:\n\n"
+    "## SectorName (display name as shown below)\n"
+    "### CategoryName (display name as shown below)\n"
+    "- C{n}: 1 to 3 sentence editorial summary.\n"
+    "- C{m}: 1 to 3 sentence editorial summary.\n\n"
+    "Repeat per sector and per category. Preserve each Cn reference "
+    "exactly: the renderer parses it to attach links."
+)
+
+STATIC_PAGE_CSS = """
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#ffffff;color:#202124;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:15px;line-height:1.65;padding:0 16px 64px;max-width:860px;margin:0 auto}
+a{color:#1a73e8;text-decoration:none}a:hover{text-decoration:underline}
+header{border-bottom:2px solid #1a73e8;padding:24px 0 14px;margin-bottom:28px}
+header h1{font-size:clamp(18px,4vw,28px);letter-spacing:.02em;color:#1a73e8}
+.wk{color:#5f6368;font-size:12px;margin-top:4px}
+.macro{background:#e8f0fe;border-left:3px solid #1a73e8;padding:16px 20px;border-radius:4px;margin:28px 0}
+.macro h2{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:#1967d2;margin-bottom:12px}
+.macro-body p{color:#3c4043;font-size:14px;margin-bottom:8px;line-height:1.6}
+.macro-body p:last-child{margin-bottom:0}
+h2{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:#5f6368;margin:28px 0 14px}
+h2.sector{font-size:18px;text-transform:none;letter-spacing:.01em;color:#1a73e8;border-bottom:1px solid #dadce0;padding-bottom:6px;margin:36px 0 12px;font-weight:600}
+h2.sector .sn{color:#5f6368;font-size:12px;font-weight:400;margin-left:8px}
+/* SPOTLIGHT: LLM editorial picks, grouped by category */
+.spotlight{margin:6px 0 12px}
+.spotlight h3.cat-block{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#1967d2;margin:14px 0 6px;border:none;padding:0;font-weight:600}
+ul.spotlight-list{list-style:none;padding:0;margin:0 0 10px}
+ul.spotlight-list li.spot-item{padding:8px 0;border-top:1px solid #dadce0}
+ul.spotlight-list li.spot-item:first-child{border-top:none}
+.spot-summary{color:#202124;font-size:14.5px;line-height:1.55;margin-bottom:6px}
+.spot-links{font-size:13px;color:#5f6368;padding-left:2px}
+.spot-links a{color:#1a73e8}
+.spot-links .also{font-size:12.5px;color:#80868b;margin-top:2px;padding-left:8px}
+.spot-links .also a{color:#1967d2}
+
+/* SEPARATOR between spotlight and dump */
+hr.sep{border:none;border-top:1px dashed #dadce0;margin:14px 0 10px}
+
+/* DUMP: mechanical, category-grouped, score-descending */
+.dump h4.dump-header{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:#5f6368;margin:4px 0 8px;font-weight:600;border:none;padding:0}
+.dump h5.dump-cat{font-size:11px;color:#3c4043;margin:10px 0 4px;font-weight:600}
+.dump h5.dump-cat .sn{color:#80868b;font-weight:400;font-size:10.5px;margin-left:4px}
+ul.dump-list{list-style:none;padding:0;margin:0 0 6px}
+ul.dump-list li{border-top:1px solid #f1f3f4;padding:5px 0;font-size:12.5px;line-height:1.45;color:#5f6368}
+ul.dump-list li:first-child{border-top:none}
+ul.dump-list li a{color:#1a73e8}
+ul.dump-list li .also{font-size:11.5px;color:#80868b;padding-left:8px;margin-top:1px}
+ul.dump-list li .also a{color:#1a73e8}
+
+.src{color:#185abc;font-size:10px;font-weight:700;margin-right:6px;letter-spacing:.02em}
+.archive{margin-top:48px;padding-top:24px;border-top:1px solid #dadce0}
+.archive h2{margin-bottom:10px}
+.archive ul{display:flex;flex-wrap:wrap;gap:8px}
+.archive li{border:none;padding:0}
+.archive a{font-size:12px;color:#3c4043;border:1px solid #dadce0;padding:3px 10px;border-radius:4px}
+.archive a:hover{color:#1a73e8;border-color:#1a73e8}
+footer{margin-top:32px;color:#80868b;font-size:11px;text-align:center}
+@media(max-width:580px){.ch{flex-direction:column}}
+"""
+
+_TUNE_KEYS = [
+    "coverage",
+    "prior",
+    "novelty",
+    "relevance",
+    "entity_signal",
+    "trend",
+    "richness",
+    "coverage_gap",
+]
 
 _embedder_cache = None
 _embedder_loaded = False
@@ -78,30 +268,6 @@ _nlp = spacy.load("en_core_web_sm", disable=["parser", "lemmatizer"])
 # the sentence-level MMR medoid summary and the lexical-cohesion richness term.
 if "sentencizer" not in _nlp.pipe_names:
     _nlp.add_pipe("sentencizer")
-_NER_LABELS = {"ORG", "PERSON", "GPE", "PRODUCT", "MONEY", "PERCENT", "DATE"}
-_ENTITY_SIGNAL_LABELS = {"ORG", "PERSON", "GPE", "PRODUCT"}
-_SOURCE_NAMES = frozenset(k.lower() for k in SOURCE_SECTOR)
-
-# Default scorer weights (before any adaptive tuning).
-# Anchor invariant: USER_PROFILE defines the discourse space; the relevance term
-# (profile-BM25) is the link to that space and its weight is floored at
-# RELEVANCE_FLOOR so adaptive tuning can never let the system drift away from it.
-DEFAULT_WEIGHTS = {
-    "coverage":       0.14,
-    "prior":          0.07,
-    "novelty":        0.09,
-    "relevance":      0.20,
-    "entity_signal":  0.06,
-    "trend":          0.05,
-    "richness":       0.06,
-    "coverage_gap":   0.06,
-    "persistence":    0.10,
-    "source_breadth": 0.07,
-    "recency":        0.10,
-}
-RELEVANCE_FLOOR = 0.20
-DUMP_RELEVANCE_FLOOR = 0.12
-WEIGHT_KEYS = list(DEFAULT_WEIGHTS.keys())
 
 
 # Age parsing for the recency-decay term. feedparser emits RFC 822 strings;
@@ -122,18 +288,18 @@ def _item_age_days(ts_str, now):
         return None
 
 
-# ── text utilities ────────────────────────────────────────────────────────────
+# ---- Text utilities ----
 
 def _norm(s):
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", s.lower())).strip()
 
 
-def _shingles(s, k=3):
+def _shingles(s, k=SHINGLE_SIZE):
     t = _norm(s).replace(" ", "")
     return {t[i:i + k] for i in range(len(t) - k + 1)} if len(t) >= k else {t}
 
 
-# ── sentence-level helpers (TREC Novelty / lexical cohesion) ──────────────────
+# ---- Sentence-level helpers (TREC Novelty / lexical cohesion) ----
 
 def _split_sentences(text):
     """Rule-based sentence boundaries via spaCy's sentencizer.
@@ -149,7 +315,8 @@ def _split_sentences(text):
     return [s.text.strip() for s in doc.sents if s.text.strip()]
 
 
-def _mmr_sentence(body, title, query, max_chars=240, lam=0.7):
+def _mmr_sentence(body, title, query, max_chars=MMR_SENTENCE_MAX_CHARS,
+                  lam=MMR_SENTENCE_LAMBDA):
     """Pick the single most information-dense sentence from `body` via MMR.
 
     Replaces the heuristic body[:240] (which assumes inverted-pyramid lede
@@ -158,8 +325,8 @@ def _mmr_sentence(body, title, query, max_chars=240, lam=0.7):
         score(s) = lam * cos(s, query) - (1 - lam) * cos(s, title)
 
     Relevance = aligned with the user's discourse query (USER_PROFILE).
-    Diversity penalty = aligned with the title, which the LLM already sees
-    — we want the body excerpt to ADD information, not echo the headline.
+    Diversity penalty = aligned with the title, which the LLM already sees.
+    We want the body excerpt to ADD information, not echo the headline.
 
     Returns the picked sentence trimmed to `max_chars`. Falls back to
     body[:max_chars] for very short bodies or vectoriser failures."""
@@ -211,7 +378,7 @@ def _lexical_cohesion(text):
     return float(np.clip(np.mean(sims), 0.0, 1.0))
 
 
-# ── NLP enrichment ────────────────────────────────────────────────────────────
+# ---- NLP enrichment ----
 
 def _is_signal_entity(text, label):
     return label in _ENTITY_SIGNAL_LABELS and text.lower() not in _SOURCE_NAMES
@@ -227,14 +394,18 @@ def enrich(rows):
             for ent in doc.ents if ent.label_ in _NER_LABELS
         }
         items.append({
-            "id": id_, "source": source, "title": title,
-            "url": url, "body": body or "", "ts": ts,
+            "id": id_,
+            "source": source,
+            "title": title,
+            "url": url,
+            "body": body or "",
+            "ts": ts,
             "entities": entities,
         })
     return items
 
 
-# ── deduplication & clustering ────────────────────────────────────────────────
+# ---- Deduplication & clustering ----
 #
 # Refactored away from MinHash LSH + union-find (single-linkage). At weekly
 # corpus scales (thousands of items, ~20k vocab) the exact cosine matrix
@@ -243,73 +414,88 @@ def enrich(rows):
 # that was always going to drift from the cosine threshold it gated.
 #
 # Clustering moved to average-linkage agglomerative with a hard cosine-distance
-# diameter — same intent as the old sim_threshold but enforced over the whole
+# diameter: same intent as the old sim_threshold but enforced over the whole
 # cluster rather than one transitive edge at a time. This kills the chaining
 # pathology where A-B and B-C linked clustered A and C with zero overlap.
 
 
 def _pairs_above(S, threshold):
-    """Yield (i, j) with i < j whose entries in the (sparse) similarity matrix
+    """Return (i, j) with i < j whose entries in the (sparse) similarity matrix
     S exceed `threshold`. S is the output of X·X^T for L2-normalised X."""
     S_coo = S.tocoo() if sp.issparse(S) else sp.coo_matrix(S)
+    found = []
     for i, j, v in zip(S_coo.row, S_coo.col, S_coo.data):
         if i < j and v >= threshold:
-            yield int(i), int(j)
+            found.append((int(i), int(j)))
+    return found
 
 
-def build_tfidf(items, sim_threshold=0.20, title_sim_threshold=0.40):
-    """Build augmented TF-IDF and the two-lane candidate edge set.
+def _augmented_text(item):
+    """Join an item's title, body, and entity tokens into one string to vectorise."""
+    entity_tokens = []
+    for entity in item["entities"]:
+        entity_tokens.append(f"ent_{entity.lower().replace(' ', '_')}")
+    joined = " ".join(entity_tokens)
+    return f"{_norm(item['title'])} {_norm(item['body'])} {joined}"
 
-    Two lanes preserved from the LSH design (different cosine thresholds
-    on different vocabulary spaces — editorial structure separates headline
-    semantics from body semantics):
 
-      • Body+title augmented TF-IDF, threshold `sim_threshold` (0.20).
-      • Title-only TF-IDF, threshold `title_sim_threshold` (0.40, stricter
-        because short text is noisier per term).
+def _fit_tfidf(texts, min_df):
+    vectorizer = TfidfVectorizer(
+        stop_words="english",
+        sublinear_tf=True,
+        ngram_range=(1, 2),
+        min_df=min_df,
+        norm="l2",
+    )
+    return {"vectorizer": vectorizer, "matrix": vectorizer.fit_transform(texts)}
 
-    `edges` is the union of both lanes — diagnostic only now; clustering
-    runs from the augmented matrix directly (see cluster_average_linkage).
 
-    `min_df=2` (was 1): drops hapaxes, URLs, typos that would otherwise
-    inflate dimensionality on persistent topics across weeks."""
-    def augmented(a):
-        ent_tokens = " ".join(
-            f"ent_{e.lower().replace(' ', '_')}" for e in a["entities"]
-        )
-        return f"{_norm(a['title'])} {_norm(a['body'])} {ent_tokens}"
+def build_tfidf(items, sim_threshold=TFIDF_SIM_THRESHOLD,
+                title_sim_threshold=TITLE_SIM_THRESHOLD):
+    """Build the augmented TF-IDF matrix and the two-lane candidate edge set.
 
-    def _fit(texts, min_df):
-        v = TfidfVectorizer(
-            stop_words="english", sublinear_tf=True,
-            ngram_range=(1, 2), min_df=min_df, norm="l2",
-        )
-        return v, v.fit_transform(texts)
+    Two lanes run on different vocabulary spaces, because editorial structure
+    separates headline semantics from body semantics: body+title augmented
+    TF-IDF at `sim_threshold`, and title-only TF-IDF at the stricter
+    `title_sim_threshold`, short text being noisier per term.
 
-    aug_texts = [augmented(a) for a in items]
+    Args:
+        items: this week's enriched articles.
+        sim_threshold: cosine floor for the body+title lane.
+        title_sim_threshold: cosine floor for the title-only lane.
+
+    Returns:
+        {"matrix": augmented TF-IDF matrix, "vectorizer": its fitted vectorizer,
+         "edges": union of both lanes, diagnostic only since clustering runs
+         from the matrix directly}
+    """
+    augmented_texts = []
+    for item in items:
+        augmented_texts.append(_augmented_text(item))
     try:
-        vec, X = _fit(aug_texts, min_df=2)
+        fitted = _fit_tfidf(augmented_texts, min_df=MIN_DOCUMENT_FREQUENCY)
     except ValueError:
-        # Tiny corpus where every term appears once — fall back so the
-        # weekly job doesn't crash on a slow ingest day.
-        vec, X = _fit(aug_texts, min_df=1)
+        # A slow ingest day can leave every term appearing once, which min_df=2
+        # rejects outright; falling back keeps the weekly job alive.
+        fitted = _fit_tfidf(augmented_texts, min_df=SPARSE_DOCUMENT_FREQUENCY)
+    X = fitted["matrix"]
 
-    # Pass 1: body+title augmented cosine.
     edges = set(_pairs_above(X.dot(X.T), sim_threshold))
 
-    # Pass 2: title-only cosine on its own vocabulary. Skip silently if the
-    # title-only corpus has too few repeating terms to survive min_df=2.
-    title_texts = [_norm(a["title"]) for a in items]
+    title_texts = []
+    for item in items:
+        title_texts.append(_norm(item["title"]))
     try:
-        _, X_title = _fit(title_texts, min_df=2)
-        edges.update(_pairs_above(X_title.dot(X_title.T), title_sim_threshold))
+        title_fitted = _fit_tfidf(title_texts, min_df=MIN_DOCUMENT_FREQUENCY)
+        title_matrix = title_fitted["matrix"]
+        edges.update(_pairs_above(title_matrix.dot(title_matrix.T), title_sim_threshold))
     except ValueError:
         pass
 
-    return X, vec, edges
+    return {"matrix": X, "vectorizer": fitted["vectorizer"], "edges": edges}
 
 
-def cluster_average_linkage(X, max_diameter=0.80):
+def cluster_average_linkage(X, max_diameter=CLUSTER_MAX_DIAMETER):
     """Average-linkage agglomerative clustering with a cosine-distance
     diameter ceiling.
 
@@ -319,7 +505,7 @@ def cluster_average_linkage(X, max_diameter=0.80):
     enforces a strict semantic radius.
 
     `max_diameter` is cosine distance (= 1 - cosine similarity). 0.80
-    corresponds roughly to "average inter-member cosine ≥ 0.20" — the
+    corresponds roughly to "average inter-member cosine ≥ 0.20": the
     same target as the old pairwise threshold, but enforced over the
     whole cluster.
 
@@ -354,7 +540,7 @@ def cluster_medoid(idxs, X):
     return idxs[int(np.asarray(sub.dot(sub.T).sum(axis=1)).ravel().argmax())]
 
 
-# ── novelty projection ────────────────────────────────────────────────────────
+# ---- Novelty projection ----
 
 def _load_last_digest(conn):
     row = conn.execute(
@@ -384,9 +570,9 @@ def _project_centroids(old_c, old_vocab, new_vocab):
     return sp.diags(1.0 / norms).dot(M)
 
 
-# ── entity trend analysis ─────────────────────────────────────────────────────
+# ---- Entity trend analysis ----
 
-def load_entity_history(conn, n_weeks=4):
+def load_entity_history(conn, n_weeks=ENTITY_HISTORY_WEEKS):
     rows = conn.execute(
         "SELECT entity, count FROM entity_history "
         "WHERE week IN (SELECT DISTINCT week FROM entity_history ORDER BY week DESC LIMIT ?) "
@@ -415,7 +601,7 @@ def save_entity_history(conn, entity_counts, week):
     )
 
 
-# ── §D longitudinal context — entity & topic memory fed to the LLM ────────────
+# ---- §D longitudinal context: entity & topic memory fed to the LLM ----
 
 def _topic_label(topic):
     """Derive a short human-readable label for a topic_bank entry from the
@@ -443,22 +629,117 @@ def _topic_label(topic):
     return " · ".join(tokens) if tokens else f"topic#{topic.get('topic_id', '?')}"
 
 
-def build_longitudinal_context(conn, week, this_week_entity_counts,
-                               top_clusters, bank,
-                               streak_min=3, dormant_min=4, top_n=5):
+def _entity_streak_lines(conn, this_week_entity_counts):
+    """Entities present in entity_history every one of the last
+    LONGITUDINAL_STREAK_MIN weeks, and present again this week."""
+    if not this_week_entity_counts:
+        return []
+    recent_weeks = [r[0] for r in conn.execute(
+        "SELECT DISTINCT week FROM entity_history ORDER BY week DESC LIMIT ?",
+        (LONGITUDINAL_STREAK_MIN,),
+    ).fetchall()]
+    if len(recent_weeks) < LONGITUDINAL_STREAK_MIN:
+        return []
+    placeholders = ",".join("?" * len(recent_weeks))
+    rows = conn.execute(
+        f"SELECT entity, COUNT(DISTINCT week) AS n "
+        f"FROM entity_history WHERE week IN ({placeholders}) "
+        f"GROUP BY entity HAVING n >= ?",
+        (*recent_weeks, LONGITUDINAL_STREAK_MIN),
+    ).fetchall()
+    this_week = set(this_week_entity_counts.keys())
+    on_streak = sorted(
+        [(entity, count) for entity, count in rows if entity in this_week],
+        key=lambda pair: (-pair[1], pair[0]),
+    )[:LONGITUDINAL_TOP_N]
+    lines = []
+    for entity, count in on_streak:
+        lines.append(f"- {entity}: appearing for {count} consecutive weeks (incl. this week)")
+    return lines
+
+
+def _last_seen_before_week(conn, week):
+    """Most recent week (other than `week`) each entity appeared in, over
+    the window needed to detect a LONGITUDINAL_DORMANT_MIN-week gap."""
+    window = LONGITUDINAL_DORMANT_MIN + 2
+    prior_weeks = [r[0] for r in conn.execute(
+        "SELECT DISTINCT week FROM entity_history WHERE week != ? "
+        "ORDER BY week DESC LIMIT ?", (week, window),
+    ).fetchall()]
+    last_seen = {}
+    for wk in prior_weeks:
+        entities_in_week = {r[0] for r in conn.execute(
+            "SELECT entity FROM entity_history WHERE week=?", (wk,),
+        ).fetchall()}
+        for entity in entities_in_week:
+            if entity not in last_seen:
+                last_seen[entity] = wk
+    return last_seen
+
+
+def _returning_entity_lines(conn, week, this_week_entity_counts):
+    """Entities present this week after a gap of LONGITUDINAL_DORMANT_MIN
+    or more weeks."""
+    if not this_week_entity_counts:
+        return []
+    last_seen = _last_seen_before_week(conn, week)
+    if not last_seen:
+        return []
+    returning = []
+    for entity in this_week_entity_counts:
+        last_week = last_seen.get(entity)
+        if not last_week:
+            continue
+        gap = _weeks_between(week, last_week)
+        if gap >= LONGITUDINAL_DORMANT_MIN:
+            returning.append((entity, gap))
+    returning.sort(key=lambda pair: (-pair[1], pair[0]))
+    lines = []
+    for entity, gap in returning[:LONGITUDINAL_TOP_N]:
+        lines.append(f"- {entity}: returns this week after {gap}-week gap")
+    return lines
+
+
+def _topic_pattern_lines(top_clusters, bank, week):
+    """Bank topics this week's clusters matched that are on a streak or
+    returning from dormancy."""
+    matched_ids = {
+        c.get("matched_topic_id") for c in top_clusters
+        if c.get("matched_topic_id") is not None
+    }
+    if not matched_ids or not bank:
+        return []
+    bank_by_id = {topic["topic_id"]: topic for topic in bank}
+    topic_streaks = []
+    topic_returns = []
+    for topic_id in matched_ids:
+        topic = bank_by_id.get(topic_id)
+        if not topic:
+            continue
+        if topic.get("weeks_seen", 0) >= LONGITUDINAL_STREAK_MIN:
+            topic_streaks.append((topic, topic["weeks_seen"]))
+        # last_week is the value BEFORE this run updated it for matched topics.
+        gap_before_this_week = _weeks_between(week, topic.get("last_week", ""))
+        if gap_before_this_week >= LONGITUDINAL_DORMANT_MIN:
+            topic_returns.append((topic, gap_before_this_week))
+    topic_streaks.sort(key=lambda pair: -pair[1])
+    topic_returns.sort(key=lambda pair: -pair[1])
+    lines = []
+    for topic, weeks_seen in topic_streaks[:LONGITUDINAL_TOPIC_DISPLAY_MAX]:
+        lines.append(f"- Topic '{_topic_label(topic)}': matched again, "
+                     f"{weeks_seen} weeks of total coverage")
+    for topic, gap in topic_returns[:LONGITUDINAL_TOPIC_DISPLAY_MAX]:
+        lines.append(f"- Topic '{_topic_label(topic)}': returns to coverage "
+                     f"after {gap}-week dormancy")
+    return lines
+
+
+def build_longitudinal_context(conn, week, this_week_entity_counts, top_clusters, bank):
     """Compact text block of multi-week patterns for the summarise() prompt.
 
-    Returns "" when entity_history has < 2 distinct weeks.
-
-    Captures four signal classes — all derived from existing tables, no new
-    persistence required:
-      1. Entity streaks: entities present every week for the last N weeks.
-      2. Returning entities: entities present this week + absent K+ weeks
-         immediately prior.
-      3. Topic streaks: bank topics matched by this week's top clusters that
-         have weeks_seen >= streak_min.
-      4. Returning topics: bank topics matched this week whose previous
-         last_week was >= dormant_min weeks ago.
+    Returns "" when entity_history has fewer than 2 distinct weeks. Combines
+    entity streaks, returning entities, and topic streaks or returns from
+    the persistent topic bank, all derived from existing tables.
     """
     n_weeks_total = conn.execute(
         "SELECT COUNT(DISTINCT week) FROM entity_history"
@@ -467,111 +748,41 @@ def build_longitudinal_context(conn, week, this_week_entity_counts,
         return ""
 
     lines = []
-
-    # --- entity streaks
-    recent_weeks = [r[0] for r in conn.execute(
-        "SELECT DISTINCT week FROM entity_history ORDER BY week DESC LIMIT ?",
-        (streak_min,),
-    ).fetchall()]
-    if len(recent_weeks) >= streak_min and this_week_entity_counts:
-        placeholders = ",".join("?" * len(recent_weeks))
-        rows = conn.execute(
-            f"SELECT entity, COUNT(DISTINCT week) AS n "
-            f"FROM entity_history WHERE week IN ({placeholders}) "
-            f"GROUP BY entity HAVING n >= ?",
-            (*recent_weeks, streak_min),
-        ).fetchall()
-        # also require entity to be in this week's stream
-        this_week = {e for e in this_week_entity_counts.keys()}
-        on_streak = sorted(
-            [(e, n) for e, n in rows if e in this_week],
-            key=lambda x: (-x[1], x[0]),
-        )[:top_n]
-        for ent, n in on_streak:
-            lines.append(f"- {ent}: appearing for {n} consecutive weeks (incl. this week)")
-
-    # --- returning entities
-    if this_week_entity_counts:
-        prior_weeks = [r[0] for r in conn.execute(
-            "SELECT DISTINCT week FROM entity_history WHERE week != ? "
-            "ORDER BY week DESC LIMIT ?", (week, dormant_min + 2),
-        ).fetchall()]
-        if prior_weeks:
-            # last appearance per entity (if any) within the recent window
-            last_seen = {}
-            for wk in prior_weeks:
-                ents_in_wk = {r[0] for r in conn.execute(
-                    "SELECT entity FROM entity_history WHERE week=?", (wk,),
-                ).fetchall()}
-                for e in ents_in_wk:
-                    if e not in last_seen:
-                        last_seen[e] = wk
-            returning = []
-            for ent in this_week_entity_counts:
-                lw = last_seen.get(ent)
-                if not lw:
-                    continue
-                gap = _weeks_between(week, lw)
-                if gap >= dormant_min:
-                    returning.append((ent, gap))
-            returning.sort(key=lambda x: (-x[1], x[0]))
-            for ent, gap in returning[:top_n]:
-                lines.append(f"- {ent}: returns this week after {gap}-week gap")
-
-    # --- topic streaks + returns
-    matched_ids = {
-        c.get("matched_topic_id") for c in top_clusters
-        if c.get("matched_topic_id") is not None
-    }
-    if matched_ids and bank:
-        bank_by_id = {t["topic_id"]: t for t in bank}
-        topic_streaks = []
-        topic_returns = []
-        for tid in matched_ids:
-            t = bank_by_id.get(tid)
-            if not t:
-                continue
-            if t.get("weeks_seen", 0) >= streak_min:
-                topic_streaks.append((t, t["weeks_seen"]))
-            gap_before_this_week = _weeks_between(week, t.get("last_week", ""))
-            # Note: t["last_week"] was the last_week BEFORE this run updated it
-            # for matched topics. We treat gap >= dormant_min as "returning".
-            if gap_before_this_week >= dormant_min:
-                topic_returns.append((t, gap_before_this_week))
-        topic_streaks.sort(key=lambda x: -x[1])
-        for t, n in topic_streaks[:3]:
-            lines.append(f"- Topic '{_topic_label(t)}': matched again, {n} weeks of total coverage")
-        topic_returns.sort(key=lambda x: -x[1])
-        for t, gap in topic_returns[:3]:
-            lines.append(f"- Topic '{_topic_label(t)}': returns to coverage after {gap}-week dormancy")
+    lines.extend(_entity_streak_lines(conn, this_week_entity_counts))
+    lines.extend(_returning_entity_lines(conn, week, this_week_entity_counts))
+    lines.extend(_topic_pattern_lines(top_clusters, bank, week))
 
     if not lines:
         return ""
     return ("Longitudinal context (multi-week entity & topic patterns; cite "
-            "explicitly when relevant — do not invent streaks not listed):\n"
+            "explicitly when relevant: do not invent streaks not listed):\n"
             + "\n".join(lines))
 
 
-# ── discourse-learning signals ────────────────────────────────────────────────
+# ---- Discourse-learning signals ----
 
 def load_entity_idf(conn):
     """Entity IDF across past weeks of entity_history. Each week = a document.
 
     idf(e) = log((1 + n_weeks_total) / (1 + n_weeks_with_e))
     Entities never seen receive the maximum IDF (n_weeks_with_e treated as 0).
-    Returns ({entity: idf}, max_idf) so callers can default unknown entities.
+
+    Returns:
+        {"idf": {entity: idf}, "max_idf": the ceiling callers use for
+        unknown entities}.
     """
     n_weeks = conn.execute(
         "SELECT COUNT(DISTINCT week) FROM entity_history"
     ).fetchone()[0] or 0
     if n_weeks == 0:
-        return {}, math.log((1 + 0) / (1 + 0) + 1.0)  # placeholder positive value
+        placeholder_max_idf = math.log((1 + 0) / (1 + 0) + 1.0)
+        return {"idf": {}, "max_idf": placeholder_max_idf}
     rows = conn.execute(
         "SELECT entity, COUNT(DISTINCT week) FROM entity_history GROUP BY entity"
     ).fetchall()
     idf = {e: math.log((1 + n_weeks) / (1 + df)) for e, df in rows}
     max_idf = math.log((1 + n_weeks) / 1.0)
-    return idf, max_idf
+    return {"idf": idf, "max_idf": max_idf}
 
 
 def _information_richness(idxs, items, entity_idf, max_idf):
@@ -633,7 +844,8 @@ def get_profile_aspects(conn):
         return [(r[0], r[1]) for r in rows]
 
     client = anthropic.Anthropic()
-    msg = _retry(lambda: client.messages.create(
+    request = partial(
+        client.messages.create,
         model="claude-haiku-4-5-20251001",
         max_tokens=600,
         system=(
@@ -647,7 +859,8 @@ def get_profile_aspects(conn):
         messages=[{"role": "user", "content": (
             "Decompose this profile into 5-9 aspects:\n\n" + USER_PROFILE.strip()
         )}],
-    ))
+    )
+    msg = _retry(request)
     text = msg.content[0].text.strip()
     m = re.search(r"\{.*\}", text, re.DOTALL)
     data = json.loads(m.group(0) if m else text)
@@ -685,7 +898,8 @@ def get_exclusion_aspects(conn):
         return [(r[0], r[1]) for r in rows]
 
     client = anthropic.Anthropic()
-    msg = _retry(lambda: client.messages.create(
+    request = partial(
+        client.messages.create,
         model="claude-haiku-4-5-20251001",
         max_tokens=400,
         system=(
@@ -702,7 +916,8 @@ def get_exclusion_aspects(conn):
             "From this profile, list 4-6 exclusion aspects (what should NOT be "
             "covered):\n\n" + USER_PROFILE.strip()
         )}],
-    ))
+    )
+    msg = _retry(request)
     text = msg.content[0].text.strip()
     m = re.search(r"\{.*\}", text, re.DOTALL)
     data = json.loads(m.group(0) if m else text)
@@ -727,7 +942,9 @@ def save_coverage_ledger(conn, week, aspect_coverage):
     )
 
 
-def compute_coverage_debt(conn, aspects, decay=0.7, window=6, threshold=0.4):
+def compute_coverage_debt(conn, aspects, decay=COVERAGE_DEBT_DECAY,
+                          window=COVERAGE_DEBT_WINDOW,
+                          threshold=COVERAGE_DEBT_THRESHOLD):
     """Decayed count of recent weeks per aspect that fell below `threshold`.
 
     Older weeks contribute less (decay^age). A high debt means the aspect has
@@ -753,7 +970,7 @@ def compute_coverage_debt(conn, aspects, decay=0.7, window=6, threshold=0.4):
     return debt
 
 
-# ── persistent topic bank (A4) ────────────────────────────────────────────────
+# ---- Persistent topic bank (A4) ----
 
 def load_topic_bank(conn):
     """Return list of bank topics with metadata. Each entry:
@@ -793,24 +1010,28 @@ def _weeks_between(later, earlier):
 
 
 def _project_bank(bank, new_vocab):
-    """Project each bank topic's centroid into new_vocab. Returns
-    (matrix, [bank_indices_present]) — matrix has one row per topic with at
-    least one overlapping term; bank entries with zero overlap are dropped."""
+    """Project every bank topic's centroid into new_vocab.
+
+    Returns:
+        {"matrix": one row per topic with at least one overlapping term, or
+        None if no topic overlapped; "present": the bank indices those rows
+        came from, in the same order}.
+    """
     if not bank:
-        return None, []
+        return {"matrix": None, "present": []}
     rows, present = [], []
-    for k, t in enumerate(bank):
-        c = _project_centroids(t["centroid"], t["vocab"], new_vocab)
-        if c is None:
+    for index, topic in enumerate(bank):
+        projected = _project_centroids(topic["centroid"], topic["vocab"], new_vocab)
+        if projected is None:
             continue
-        rows.append(c)
-        present.append(k)
+        rows.append(projected)
+        present.append(index)
     if not rows:
-        return None, []
-    return sp.vstack(rows), present
+        return {"matrix": None, "present": []}
+    return {"matrix": sp.vstack(rows), "present": present}
 
 
-def _truncate_centroid(centroid, top_n=200):
+def _truncate_centroid(centroid, top_n=TOPIC_CENTROID_TOP_N):
     """Sparsity constraint after the alpha-blend in update_topic_bank.
 
     Exponential moving averages of sparse TF-IDF vectors accumulate tiny
@@ -829,7 +1050,7 @@ def _truncate_centroid(centroid, top_n=200):
         arr = np.asarray(centroid).ravel()
     if arr.size <= top_n:
         return centroid if sp.issparse(centroid) else sp.csr_matrix(arr.reshape(1, -1))
-    # argpartition is O(n) — much cheaper than full argsort at this scale.
+    # argpartition is O(n): much cheaper than full argsort at this scale.
     keep = np.argpartition(-np.abs(arr), top_n)[:top_n]
     truncated = np.zeros_like(arr)
     truncated[keep] = arr[keep]
@@ -839,73 +1060,92 @@ def _truncate_centroid(centroid, top_n=200):
     return sp.csr_matrix(truncated.reshape(1, -1))
 
 
-def update_topic_bank(conn, top, vec, week, alpha=0.7, match_threshold=0.3,
-                      decay=0.8, mass_floor=0.05, stale_weeks=12,
-                      centroid_top_n=200):
+def _merge_matched_topic(conn, cluster, inv_vocab, vocabulary, week):
+    """Blend a cluster's centroid into its matched topic_bank row.
+
+    Returns the matched topic_id on success, or None when the cluster has
+    no confident match, so the caller spawns a new topic instead."""
+    topic_id = cluster.get("matched_topic_id")
+    similarity = cluster.get("matched_sim", 0.0)
+    if topic_id is None or similarity < TOPIC_BANK_MATCH_THRESHOLD:
+        return None
+    row = conn.execute(
+        "SELECT centroid, vocab, mass, weeks_seen FROM topic_bank WHERE topic_id=?",
+        (topic_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    old_centroid, old_vocab, mass, weeks_seen = (
+        pickle.loads(row[0]), pickle.loads(row[1]), row[2], row[3]
+    )
+    projected_old = _project_centroids(old_centroid, old_vocab, vocabulary)
+    if projected_old is None:
+        merged = cluster["vec"]
+    else:
+        merged = TOPIC_BANK_ALPHA * projected_old + (1 - TOPIC_BANK_ALPHA) * cluster["vec"]
+    # Sparsity constraint: see _truncate_centroid docstring.
+    merged = _truncate_centroid(merged)
+
+    conn.execute(
+        "UPDATE topic_bank SET centroid=?, vocab=?, mass=?, "
+        "last_week=?, weeks_seen=? WHERE topic_id=?",
+        (
+            pickle.dumps(merged),
+            pickle.dumps(inv_vocab),
+            mass + 1.0,
+            week,
+            weeks_seen + 1,
+            topic_id,
+        ),
+    )
+    return topic_id
+
+
+def _spawn_topic(conn, cluster, inv_vocab, week):
+    cursor = conn.execute(
+        "INSERT INTO topic_bank(centroid, vocab, mass, first_week, last_week, weeks_seen) "
+        "VALUES(?,?,?,?,?,?)",
+        (pickle.dumps(cluster["vec"]), pickle.dumps(inv_vocab), 1.0, week, week, 1),
+    )
+    return cursor.lastrowid
+
+
+def _decay_and_prune_bank(conn, week):
+    """Age every topic's mass, then drop rows that went stale or too light."""
+    conn.execute("UPDATE topic_bank SET mass = mass * ?", (TOPIC_BANK_DECAY,))
+    rows = conn.execute("SELECT topic_id, last_week FROM topic_bank").fetchall()
+    stale_ids = []
+    for topic_id, last_week in rows:
+        if _weeks_between(week, last_week) > TOPIC_BANK_STALE_WEEKS:
+            stale_ids.append((topic_id,))
+    if stale_ids:
+        conn.executemany("DELETE FROM topic_bank WHERE topic_id=?", stale_ids)
+    conn.execute("DELETE FROM topic_bank WHERE mass < ?", (TOPIC_BANK_MASS_FLOOR,))
+
+
+def update_topic_bank(conn, top, vec, week):
     """Merge or spawn topics in topic_bank from this week's top clusters.
 
     Each cluster in `top` already carries a tentative `matched_topic_id` and
-    `matched_sim` set by score_clusters; this function commits the matches,
-    spawns rows for unmatched clusters, decays all topics, and prunes stale
-    rows. Writes the final `topic_id` back onto each cluster dict."""
+    `matched_sim` set by score_clusters; this commits the matches, spawns
+    rows for unmatched clusters, decays all topics, and prunes stale rows.
+    Writes the final `topic_id` back onto each cluster dict.
+    """
     inv_vocab = [None] * len(vec.vocabulary_)
-    for term, idx in vec.vocabulary_.items():
-        inv_vocab[idx] = term
+    for term, index in vec.vocabulary_.items():
+        inv_vocab[index] = term
 
-    for c in top:
-        mid = c.get("matched_topic_id")
-        sim = c.get("matched_sim", 0.0)
-        if mid is not None and sim >= match_threshold:
-            row = conn.execute(
-                "SELECT centroid, vocab, mass, weeks_seen FROM topic_bank WHERE topic_id=?",
-                (mid,),
-            ).fetchone()
-            if row is None:
-                mid = None
-            else:
-                old_cent, old_vocab, mass, weeks_seen = (
-                    pickle.loads(row[0]), pickle.loads(row[1]), row[2], row[3]
-                )
-                projected_old = _project_centroids(old_cent, old_vocab, vec.vocabulary_)
-                if projected_old is None:
-                    merged = c["vec"]
-                else:
-                    merged = alpha * projected_old + (1 - alpha) * c["vec"]
-                # Sparsity constraint — see _truncate_centroid docstring.
-                merged = _truncate_centroid(merged, top_n=centroid_top_n)
-                conn.execute(
-                    "UPDATE topic_bank SET centroid=?, vocab=?, mass=?, "
-                    "last_week=?, weeks_seen=? WHERE topic_id=?",
-                    (pickle.dumps(merged), pickle.dumps(inv_vocab),
-                     mass + 1.0, week, weeks_seen + 1, mid),
-                )
-                c["topic_id"] = mid
-                continue
-        # spawn new topic
-        cur = conn.execute(
-            "INSERT INTO topic_bank(centroid, vocab, mass, first_week, last_week, weeks_seen) "
-            "VALUES(?,?,?,?,?,?)",
-            (pickle.dumps(c["vec"]), pickle.dumps(inv_vocab),
-             1.0, week, week, 1),
-        )
-        c["topic_id"] = cur.lastrowid
+    for cluster in top:
+        topic_id = _merge_matched_topic(conn, cluster, inv_vocab, vec.vocabulary_, week)
+        if topic_id is None:
+            topic_id = _spawn_topic(conn, cluster, inv_vocab, week)
+        cluster["topic_id"] = topic_id
 
-    # decay all and prune
-    conn.execute("UPDATE topic_bank SET mass = mass * ?", (decay,))
-    # delete stale (haven't appeared in stale_weeks weeks) or below mass floor
-    rows = conn.execute(
-        "SELECT topic_id, last_week FROM topic_bank"
-    ).fetchall()
-    to_delete = [
-        (tid,) for tid, lw in rows
-        if _weeks_between(week, lw) > stale_weeks
-    ]
-    if to_delete:
-        conn.executemany("DELETE FROM topic_bank WHERE topic_id=?", to_delete)
-    conn.execute("DELETE FROM topic_bank WHERE mass < ?", (mass_floor,))
+    _decay_and_prune_bank(conn, week)
 
 
-# ── adaptive weights (A5) ─────────────────────────────────────────────────────
+# ---- Adaptive weights (A5) ----
 
 def load_weights(conn):
     row = conn.execute(
@@ -944,85 +1184,129 @@ def _enforce_floor(weights):
     return w
 
 
-_TUNE_KEYS = [
-    "coverage", "prior", "novelty", "relevance",
-    "entity_signal", "trend", "richness", "coverage_gap",
-]
-
-def tune_weights(conn, min_weeks=10):
-    """Fit logistic regression of signals → topic-persistence and blend the
-    learned weights with the current weights. Skips if history is shallow or
-    the persistence label is degenerate. Writes a row to scorer_weights and
-    logs old vs new.
-
-    Only the 8 signals stored in cluster_signals are fitted (_TUNE_KEYS).
-    persistence/source_breadth/recency are carried over from current weights
-    unchanged — persistence would leak (it is bank-derived, same axis as the
-    label), and the other two are recency heuristics without historical rows.
-
-    Persistence label is leak-free: a row at (week=wk, topic_id=t) "persisted"
-    iff that same topic_id appears in cluster_signals for any week > wk."""
-    rows = conn.execute(
+def _load_signal_rows(conn):
+    return conn.execute(
         "SELECT cs.week, cs.topic_id, cs.coverage, cs.prior, cs.novelty, "
         "cs.relevance, cs.entity_signal, cs.trend, cs.richness, cs.coverage_gap "
         "FROM cluster_signals cs "
         "WHERE cs.topic_id IS NOT NULL"
     ).fetchall()
-    weeks_in_data = {r[0] for r in rows}
+
+
+def _persistence_labels(rows):
+    """Build the (signals, persisted) training set from cluster_signals rows.
+
+    A row at (week=wk, topic_id=t) "persisted" iff that same topic_id
+    appears in cluster_signals for any later week. This label is leak-free:
+    it never reads the current week's own outcome.
+
+    Returns:
+        {"signals": float array, "labels": int array}, one row per input row.
+    """
+    later_weeks = defaultdict(set)
+    for row in rows:
+        week, topic_id = row[0], row[1]
+        later_weeks[topic_id].add(week)
+
+    signals, labels = [], []
+    for row in rows:
+        week, topic_id = row[0], row[1]
+        signals.append(list(row[2:10]))
+        persisted = int(any(later_week > week for later_week in later_weeks[topic_id]))
+        labels.append(persisted)
+    return {
+        "signals": np.array(signals, dtype=float),
+        "labels": np.array(labels, dtype=int),
+    }
+
+
+def _fit_positive_coefficients(X, y):
+    """Fit logistic regression on the signal matrix and return only its
+    positive coefficients, clipped to zero elsewhere.
+
+    Returns None when the label is degenerate (all one class) or every
+    coefficient came out non-positive."""
+    if len(set(y.tolist())) < 2:
+        print(f"tune_weights: skip (degenerate label, {y.sum()}/{len(y)} positive)")
+        return None
+    from sklearn.linear_model import LogisticRegression
+    model = LogisticRegression(max_iter=500)
+    model.fit(X, y)
+    positive = np.clip(model.coef_[0], 0, None)
+    if positive.sum() <= 0:
+        print("tune_weights: skip (no positive coefficients)")
+        return None
+    return positive
+
+
+def _blend_learned_weights(conn, positive_coefficients):
+    """Blend logistic-regression-learned weights with the current weights.
+
+    Only the _TUNE_KEYS signals are fitted. persistence, source_breadth, and
+    recency carry over from the current weights unchanged: persistence would
+    leak (it is bank-derived, the same axis as the label), and the other two
+    are recency heuristics with no historical rows to fit on.
+
+    Returns:
+        {"current": weights before tuning, "final": blended and
+        floor-enforced weights}.
+    """
+    current = load_weights(conn)
+    learned_partial = {
+        key: float(positive_coefficients[i] / positive_coefficients.sum())
+        for i, key in enumerate(_TUNE_KEYS)
+    }
+    frozen_keys = [key for key in WEIGHT_KEYS if key not in learned_partial]
+    frozen_total = sum(current.get(key, 0.0) for key in frozen_keys)
+    fit_total = 1.0 - frozen_total
+    learned = {
+        key: learned_partial.get(key, 0.0) * max(fit_total, 1e-9)
+        for key in WEIGHT_KEYS
+    }
+    for key in frozen_keys:
+        learned[key] = current.get(key, DEFAULT_WEIGHTS[key])
+
+    blended = {
+        key: TUNE_BLEND_CURRENT * current[key] + TUNE_BLEND_LEARNED * learned[key]
+        for key in WEIGHT_KEYS
+    }
+    total = sum(blended.values())
+    if total > 0:
+        blended = {key: value / total for key, value in blended.items()}
+    return {"current": current, "final": _enforce_floor(blended)}
+
+
+def _save_tuned_weights(conn, weights):
+    week = datetime.now(timezone.utc).strftime("%Y-W%V")
+    conn.execute(
+        "INSERT OR REPLACE INTO scorer_weights(week, weights, created_at) VALUES(?,?,?)",
+        (week, json.dumps(weights), now_iso()),
+    )
+
+
+def tune_weights(conn, min_weeks=TUNE_MIN_WEEKS):
+    """Fit logistic regression of signals to topic persistence and blend the
+    learned weights with the current weights.
+
+    Skips if history is shallow or the persistence label is degenerate.
+    Writes a row to scorer_weights and logs old vs new.
+    """
+    rows = _load_signal_rows(conn)
+    weeks_in_data = {row[0] for row in rows}
     if len(weeks_in_data) < min_weeks:
         print(f"tune_weights: skip ({len(weeks_in_data)} weeks < {min_weeks})")
         return None
 
-    later_weeks = {}
-    for r in rows:
-        tid = r[1]
-        wk = r[0]
-        if tid not in later_weeks:
-            later_weeks[tid] = set()
-        later_weeks[tid].add(wk)
-
-    X, y = [], []
-    for r in rows:
-        wk, tid = r[0], r[1]
-        signals = list(r[2:10])
-        persisted = int(any(w > wk for w in later_weeks.get(tid, set())))
-        X.append(signals)
-        y.append(persisted)
-    X = np.array(X, dtype=float)
-    y = np.array(y, dtype=int)
-    if len(set(y.tolist())) < 2:
-        print(f"tune_weights: skip (degenerate label, {y.sum()}/{len(y)} positive)")
-        return None
-
-    from sklearn.linear_model import LogisticRegression
-    lr = LogisticRegression(max_iter=500)
-    lr.fit(X, y)
-    coefs = lr.coef_[0]
-    pos = np.clip(coefs, 0, None)
-    if pos.sum() <= 0:
-        print("tune_weights: skip (no positive coefficients)")
-        return None
-
-    current = load_weights(conn)
-    learned_partial = {k: float(pos[i] / pos.sum()) for i, k in enumerate(_TUNE_KEYS)}
-    frozen_keys = [k for k in WEIGHT_KEYS if k not in learned_partial]
-    frozen_total = sum(current.get(k, 0.0) for k in frozen_keys)
-    fit_total = 1.0 - frozen_total
-    learned = {k: learned_partial.get(k, 0.0) * max(fit_total, 1e-9) for k in WEIGHT_KEYS}
-    for k in frozen_keys:
-        learned[k] = current.get(k, DEFAULT_WEIGHTS[k])
-
-    blended = {k: 0.7 * current[k] + 0.3 * learned[k] for k in WEIGHT_KEYS}
-    total = sum(blended.values())
-    if total > 0:
-        blended = {k: v / total for k, v in blended.items()}
-    final = _enforce_floor(blended)
-
-    week = datetime.now(timezone.utc).strftime("%Y-W%V")
-    conn.execute(
-        "INSERT OR REPLACE INTO scorer_weights(week, weights, created_at) VALUES(?,?,?)",
-        (week, json.dumps(final), now_iso()),
+    training = _persistence_labels(rows)
+    positive_coefficients = _fit_positive_coefficients(
+        training["signals"], training["labels"]
     )
+    if positive_coefficients is None:
+        return None
+
+    blend = _blend_learned_weights(conn, positive_coefficients)
+    current, final = blend["current"], blend["final"]
+    _save_tuned_weights(conn, final)
     print(f"tune_weights: old={current} -> new={final}")
     return final
 
@@ -1031,21 +1315,24 @@ def save_cluster_signals(conn, week, top):
     """Persist per-cluster signal vector + score so A5 can fit retrospectively.
     Keyed by (week, topic_id); topic_id is set by update_topic_bank earlier."""
     rows = [
-        (week, c.get("topic_id"),
-         float(c["signals"].get("coverage", 0.0)),
-         float(c["signals"].get("prior", 0.0)),
-         float(c["signals"].get("novelty", 0.0)),
-         float(c["signals"].get("relevance", 0.0)),
-         float(c["signals"].get("entity_signal", 0.0)),
-         float(c["signals"].get("trend", 0.0)),
-         float(c["signals"].get("richness", 0.0)),
-         float(c["signals"].get("coverage_gap", 0.0)),
-         float(c["signals"].get("profile_exclusion", 0.0)),
-         float(c["signals"].get("persistence_rate", -1.0)),
-         float(c["signals"].get("persistence", 0.0)),
-         float(c["signals"].get("source_breadth", 0.0)),
-         float(c["signals"].get("recency", 0.0)),
-         float(c["score"]))
+        (
+            week,
+            c.get("topic_id"),
+            float(c["signals"].get("coverage", 0.0)),
+            float(c["signals"].get("prior", 0.0)),
+            float(c["signals"].get("novelty", 0.0)),
+            float(c["signals"].get("relevance", 0.0)),
+            float(c["signals"].get("entity_signal", 0.0)),
+            float(c["signals"].get("trend", 0.0)),
+            float(c["signals"].get("richness", 0.0)),
+            float(c["signals"].get("coverage_gap", 0.0)),
+            float(c["signals"].get("profile_exclusion", 0.0)),
+            float(c["signals"].get("persistence_rate", -1.0)),
+            float(c["signals"].get("persistence", 0.0)),
+            float(c["signals"].get("source_breadth", 0.0)),
+            float(c["signals"].get("recency", 0.0)),
+            float(c["score"]),
+        )
         for c in top if c.get("topic_id") is not None
     ]
     if rows:
@@ -1059,7 +1346,7 @@ def save_cluster_signals(conn, week, top):
         )
 
 
-# ── sector / category classification ───────────────────────────────────────────
+# ---- Sector / category classification ----
 
 def classify_sector(idxs, items):
     """Dominant sector across a cluster's items (majority of sources)."""
@@ -1086,283 +1373,363 @@ def classify_category(idxs, items):
     return best
 
 
-# ── cluster scoring ───────────────────────────────────────────────────────────
+# ---- Cluster scoring ----
 
 def _normalize(arr):
     lo, hi = arr.min(), arr.max()
     return (arr - lo) / (hi - lo + 1e-9)
 
 
-def _cluster_top_entities(idxs, items, velocities, n=5):
-    counts = defaultdict(int)
-    for i in idxs:
-        for e, label in items[i]["entities"].items():
-            if _is_signal_entity(e, label) and label in {"ORG", "PERSON", "PRODUCT"}:
-                counts[e] += 1
-    return sorted(
-        counts.items(),
-        key=lambda x: (x[1], velocities.get(x[0], 0.0)),
-        reverse=True,
-    )[:n]
+def _medoid_scores(bm25, medoids, tokens):
+    scores = bm25.get_scores(tokens)
+    return np.array([scores[m] for m in medoids])
 
 
-def score_clusters(clusters, items, X, vec, velocities, bank, aspects, debt,
-                   entity_idf, max_idf, weights, week, exclusion_aspects=None,
-                   E=None):
-    """Score clusters with the dict-weighted linear model.
+def _add_rrf_ranks(totals, values):
+    order = np.argsort(-values)
+    fused = totals.copy()
+    for rank, idx in enumerate(order):
+        fused[idx] += 1.0 / (RRF_K + rank + 1)
+    return fused
 
-    Returns (scored_clusters, aspect_coverage) where aspect_coverage is the
-    per-aspect max coverage this week, normalised to [0,1] for the
-    coverage_ledger.
 
-    `exclusion_aspects` (optional): list of (label, descriptor) decomposed
-    from USER_PROFILE's 'Not relevant' clause. When present, each cluster
-    gets a `profile_exclusion` signal used by the pre-MMR off-profile filter.
+def _lexical_relevance(inputs, medoids, bm25):
+    """Fuse one BM25 ranking per profile aspect by reciprocal rank."""
+    aspects = inputs["aspects"]
+    if not aspects:
+        tokens = _norm(USER_PROFILE).split()
+        return _medoid_scores(bm25, medoids, tokens)
+    totals = np.zeros(len(medoids))
+    for label, descriptor in aspects:
+        tokens = _norm(descriptor).split() or _norm(label).split()
+        if not tokens:
+            continue
+        totals = _add_rrf_ranks(totals, _medoid_scores(bm25, medoids, tokens))
+    return totals
 
-    `E` (optional): (n_items, d) normalized dense embedding matrix computed
-    once by run(). When present, a dense lane is RRF-fused with the lexical
-    BM25 lane for both relevance and exclusion (§6.12 hybrid recipe). When
-    absent, falls back to pure lexical behavior."""
-    medoids = [cluster_medoid(c, X) for c in clusters]
-    medoid_vecs = sp.vstack([X[m] for m in medoids])
 
-    corpus = [_norm(f"{a['title']} {a['body']}").split() for a in items]
-    bm25 = BM25Okapi(corpus)
+def _dense_relevance(inputs, medoids):
+    """Fuse one embedding-cosine ranking per profile aspect by reciprocal rank."""
+    embeddings = inputs["embeddings"]
+    aspects = inputs["aspects"]
+    totals = np.zeros(len(medoids))
+    if embeddings is None or not aspects:
+        return totals
+    aspect_embs = _embed_aspects(aspects, _profile_hash())
+    if aspect_embs is None:
+        return totals
+    medoid_embs = embeddings[medoids]
+    for position in range(len(aspects)):
+        sims = medoid_embs @ aspect_embs[position]
+        totals = _add_rrf_ranks(totals, sims)
+    return totals
 
-    ph = _profile_hash()
-    _RRF_K = 60
-    n_cl = len(clusters)
 
-    # ── relevance: per-aspect BM25 RRF (lexical lane) ────────────────────────
-    rrf_lex = np.zeros(n_cl)
-    if aspects:
-        for _a, desc in aspects:
-            desc_tokens = _norm(desc).split() or _norm(_a).split()
-            if not desc_tokens:
-                continue
-            scores = bm25.get_scores(desc_tokens)
-            raw = np.array([scores[m] for m in medoids])
-            order = np.argsort(-raw)
-            for rank, idx in enumerate(order):
-                rrf_lex[idx] += 1.0 / (_RRF_K + rank + 1)
-    else:
-        user_q = _norm(USER_PROFILE).split()
-        raw_bm25 = bm25.get_scores(user_q)
-        rrf_lex = np.array([raw_bm25[m] for m in medoids])
+def _novelty_against_bank(inputs, medoid_vecs):
+    """Novelty as distance from the persistent topic bank, plus a dormancy bonus.
 
-    # ── relevance: dense lane (aspect cosine via RRF), fused with lexical ────
-    rrf_dense_rel = np.zeros(n_cl)
-    aspect_embs = _embed_aspects(aspects, ph) if (E is not None and aspects) else None
-    if aspect_embs is not None and E is not None:
-        medoid_embs = E[medoids]                       # (n_cl, d)
-        for a_idx in range(len(aspects)):
-            q_vec = aspect_embs[a_idx]                 # (d,)
-            sims = medoid_embs @ q_vec                 # (n_cl,)
-            order = np.argsort(-sims)
-            for rank, idx in enumerate(order):
-                rrf_dense_rel[idx] += 1.0 / (_RRF_K + rank + 1)
-        rrf_scores = rrf_lex + rrf_dense_rel
-    else:
-        rrf_scores = rrf_lex
+    Args:
+        inputs: the scoring inputs dictionary.
+        medoid_vecs: sparse matrix of one medoid vector per cluster.
 
-    relevance = _normalize(rrf_scores)
-
-    sizes = np.array([len(c) for c in clusters])
-    coverage = np.log1p(sizes) / np.log1p(max(sizes.max(), 1))
-
-    prior = _normalize(np.array([
-        np.mean([SOURCE_PRIORS.get(items[i]["source"], 1.0) for i in c])
-        for c in clusters
-    ]))
-
-    # Novelty against the persistent topic bank (A4) — replaces the previous
-    # one-week diff. Also attach matched_topic_id + matched_sim to each cluster
-    # so update_topic_bank can commit merges/spawns after MMR selection.
+    Returns:
+        {"novelty": array, "matched_ids": list, "matched_sims": array}, where a
+        matched id is None when the cluster matched no topic in the bank.
+    """
+    clusters = inputs["clusters"]
+    bank = inputs["bank"]
+    week = inputs["week"]
     matched_ids = [None] * len(clusters)
     matched_sims = np.zeros(len(clusters))
     dormant_bonus = np.zeros(len(clusters))
-    bank_matrix, bank_present = _project_bank(bank, vec.vocabulary_)
+    projection = _project_bank(bank, inputs["vec"].vocabulary_)
+    bank_matrix, bank_present = projection["matrix"], projection["present"]
     if bank_matrix is not None:
-        sims = medoid_vecs.dot(bank_matrix.T).toarray()  # (n_clusters, n_topics_present)
+        sims = medoid_vecs.dot(bank_matrix.T).toarray()
         best_idx = sims.argmax(axis=1)
         best_sim = sims.max(axis=1)
         for i in range(len(clusters)):
-            t = bank[bank_present[best_idx[i]]]
-            matched_ids[i] = t["topic_id"]
+            topic = bank[bank_present[best_idx[i]]]
+            matched_ids[i] = topic["topic_id"]
             matched_sims[i] = float(best_sim[i])
-            # Partial novelty if matched topic has been dormant >= 4 weeks
-            if _weeks_between(week, t["last_week"]) >= 4:
-                dormant_bonus[i] = 0.3
-    novelty = np.clip(1.0 - matched_sims + dormant_bonus, 0.0, 1.0)
+            if _weeks_between(week, topic["last_week"]) >= DORMANT_WEEKS:
+                dormant_bonus[i] = DORMANT_NOVELTY_BONUS
+    return {
+        "novelty": np.clip(1.0 - matched_sims + dormant_bonus, 0.0, 1.0),
+        "matched_ids": matched_ids,
+        "matched_sims": matched_sims,
+    }
 
-    # Entity signal with IDF reweighting (A1) and richness (A2)
-    ent_signals, cluster_trends, richness_raw = [], [], []
-    for c in clusters:
-        ent_counts = defaultdict(int)
-        for i in c:
-            for e, lbl in items[i]["entities"].items():
-                if _is_signal_entity(e, lbl):
-                    ent_counts[e] += 1
-        signal = 0.0
-        for e, cnt in ent_counts.items():
-            idf_w = entity_idf.get(e, max_idf)
-            boost = 2 if e in KEY_ENTITIES else 1
-            signal += cnt * idf_w * boost
-        ent_signals.append(signal)
-        top5 = sorted(ent_counts, key=ent_counts.get, reverse=True)[:5]
-        vels = [velocities.get(e, 0.0) for e in top5]
-        cluster_trends.append(sum(vels) / max(len(vels), 1))
-        richness_raw.append(_information_richness(c, items, entity_idf, max_idf))
 
-    entity_signal = _normalize(np.array(ent_signals, dtype=float))
-    trend_norm = _normalize(np.clip(np.array(cluster_trends, dtype=float), -1, 3))
-    richness = _normalize(np.array(richness_raw, dtype=float))
+def _signal_entity_counts(cluster, items):
+    counts = defaultdict(int)
+    for i in cluster:
+        for entity, label in items[i]["entities"].items():
+            if _is_signal_entity(entity, label):
+                counts[entity] += 1
+    return counts
 
-    # Aspect coverage and coverage_gap (A3)
-    # Anchor invariant: aspects are derived FROM USER_PROFILE; coverage_gap
-    # sharpens *within* the profile's space, never redirects it.
-    coverage_gap = np.zeros(len(clusters))
-    aspect_coverage = {}
-    if aspects:
-        per_aspect_medoid_scores = {}
-        for a, desc in aspects:
-            desc_tokens = _norm(desc).split() or _norm(a).split()
-            scores = bm25.get_scores(desc_tokens)
-            medoid_scores = np.array([scores[m] for m in medoids])
-            per_aspect_medoid_scores[a] = medoid_scores
-            if medoid_scores.size:
-                # per-aspect coverage this week = max across medoids, normalised
-                mx = float(medoid_scores.max())
-                aspect_coverage[a] = mx
-        # normalise aspect_coverage across aspects to [0,1] for the ledger
-        if aspect_coverage:
-            mx_all = max(aspect_coverage.values()) or 1.0
-            aspect_coverage = {a: v / mx_all for a, v in aspect_coverage.items()}
-        # for each cluster, find its best-matching aspect and use that aspect's debt
-        gap_raw = np.zeros(len(clusters))
-        if per_aspect_medoid_scores:
-            stack = np.stack(list(per_aspect_medoid_scores.values()))  # (n_aspects, n_clusters)
-            aspect_keys = list(per_aspect_medoid_scores.keys())
-            best_aspect_idx = stack.argmax(axis=0)
-            for i in range(len(clusters)):
-                gap_raw[i] = float(debt.get(aspect_keys[best_aspect_idx[i]], 0.0))
-        coverage_gap = _normalize(gap_raw) if gap_raw.max() > 0 else gap_raw
 
-    # Profile-exclusion signal (Layer A of §2.4). Hybrid: lexical BM25 max
-    # across exclusion-aspect descriptors, RRF-fused with a dense cosine lane
-    # when E is available. The dense lane is what catches celebrity/consumer-
-    # tech leakage where BM25 vocabulary fails (evaluation §1). Used as a
-    # filter input only — NOT a positive score term.
-    profile_exclusion = np.zeros(n_cl)
-    if exclusion_aspects:
-        excl_lex = np.zeros(n_cl)
-        for a, desc in exclusion_aspects:
-            desc_tokens = _norm(desc).split() or _norm(a).split()
-            if not desc_tokens:
-                continue
-            scores_excl = bm25.get_scores(desc_tokens)
-            arr = np.array([scores_excl[m] for m in medoids])
-            excl_lex = np.maximum(excl_lex, arr)
+def _entity_signals(inputs):
+    """Entity weight, trend velocity, and information richness, one value per cluster."""
+    items = inputs["items"]
+    entity_idf = inputs["entity_idf"]
+    max_idf = inputs["max_idf"]
+    velocities = inputs["velocities"]
+    weight_raw = []
+    trend_raw = []
+    richness_raw = []
+    for cluster in inputs["clusters"]:
+        counts = _signal_entity_counts(cluster, items)
+        weight = 0.0
+        for entity, count in counts.items():
+            idf = entity_idf.get(entity, max_idf)
+            boost = KEY_ENTITY_BOOST if entity in KEY_ENTITIES else 1
+            weight += count * idf * boost
+        weight_raw.append(weight)
+        loudest = sorted(counts, key=counts.get, reverse=True)[:TOP_ENTITIES_PER_CLUSTER]
+        speeds = [velocities.get(entity, 0.0) for entity in loudest]
+        trend_raw.append(sum(speeds) / max(len(speeds), 1))
+        richness_raw.append(_information_richness(cluster, items, entity_idf, max_idf))
+    trend = np.clip(np.array(trend_raw, dtype=float), TREND_CLIP_LOW, TREND_CLIP_HIGH)
+    return {
+        "entity_signal": _normalize(np.array(weight_raw, dtype=float)),
+        "trend": _normalize(trend),
+        "richness": _normalize(np.array(richness_raw, dtype=float)),
+    }
 
-        excl_dense = np.zeros(n_cl)
-        excl_embs = _embed_aspects(exclusion_aspects, ph + "_excl") if E is not None else None
-        if excl_embs is not None and E is not None:
-            medoid_embs = E[medoids]
-            for a_idx in range(len(exclusion_aspects)):
-                q_vec = excl_embs[a_idx]
-                sims = medoid_embs @ q_vec
-                excl_dense = np.maximum(excl_dense, sims)
 
-        combined = excl_lex / (excl_lex.max() + 1e-9) + excl_dense / (excl_dense.max() + 1e-9)
-        if combined.max() > 0:
-            profile_exclusion = _normalize(combined)
+def _coverage_gap(inputs, medoids, bm25):
+    """How far behind each cluster's best-matching aspect is on the coverage ledger.
 
-    # Persistence rate (Layer B precursor of §2.4). For each cluster's
-    # matched topic in the bank, the empirical recurrence rate
-    # (weeks_seen / weeks_since_first_seen). Used by the run() filter once
-    # ≥ 10 weeks of history exist. -1.0 means "no matched topic yet".
-    persistence_rate = -np.ones(len(clusters))
-    if bank:
-        bank_by_id = {t["topic_id"]: t for t in bank}
-        for i in range(len(clusters)):
-            mid = matched_ids[i]
-            if mid is None or mid not in bank_by_id:
-                continue
-            t = bank_by_id[mid]
-            span = max(_weeks_between(week, t["first_week"]), 1)
-            persistence_rate[i] = float(t["weeks_seen"]) / span
+    Anchor invariant: aspects are derived FROM USER_PROFILE, so this sharpens
+    within the profile's space and never redirects it.
 
-    # §B.1 — persistence as a positive score term. The signal is the same
-    # weeks_seen / weeks_since_first_seen ratio used by Layer B of the
-    # off-profile filter, but flipped into a positive contribution: a cluster
-    # whose matched bank topic has earned multiple appearances gets a boost.
-    # Net effect with novelty:  flash-in-pan matches lose; multi-week ongoing
-    # matches win. Unmatched clusters get 0 (no boost, no penalty).
-    persistence_signal = np.clip(persistence_rate, 0.0, 1.0)
-    if persistence_signal.max() > 0:
-        persistence_signal = _normalize(persistence_signal)
+    Args:
+        inputs: the scoring inputs dictionary.
+        medoids: index of the representative item of each cluster.
+        bm25: fitted BM25 index over every item this week.
 
-    # §E.1 — source_breadth: # of distinct sources covering this cluster.
-    # Wire-service heuristic: the more independent outlets, the more real.
-    sb_raw = np.array([
-        float(len({items[i]["source"] for i in c})) for c in clusters
-    ], dtype=float)
-    source_breadth = _normalize(np.log1p(sb_raw))
+    Returns:
+        {"coverage_gap": array, "aspect_coverage": per-aspect max normalised to [0, 1]}
+    """
+    clusters = inputs["clusters"]
+    aspects = inputs["aspects"]
+    if not aspects:
+        return {"coverage_gap": np.zeros(len(clusters)), "aspect_coverage": {}}
+    per_aspect = {}
+    coverage = {}
+    for label, descriptor in aspects:
+        tokens = _norm(descriptor).split() or _norm(label).split()
+        medoid_scores = _medoid_scores(bm25, medoids, tokens)
+        per_aspect[label] = medoid_scores
+        if medoid_scores.size:
+            coverage[label] = float(medoid_scores.max())
+    if coverage:
+        highest = max(coverage.values()) or 1.0
+        coverage = {label: value / highest for label, value in coverage.items()}
+    if not per_aspect:
+        return {"coverage_gap": np.zeros(len(clusters)), "aspect_coverage": coverage}
+    stack = np.stack(list(per_aspect.values()))
+    labels = list(per_aspect.keys())
+    best_aspect = stack.argmax(axis=0)
+    gap_raw = np.zeros(len(clusters))
+    for i in range(len(clusters)):
+        gap_raw[i] = float(inputs["debt"].get(labels[best_aspect[i]], 0.0))
+    if gap_raw.max() > 0:
+        return {"coverage_gap": _normalize(gap_raw), "aspect_coverage": coverage}
+    return {"coverage_gap": gap_raw, "aspect_coverage": coverage}
 
-    # §E.7 — recency: exp(-age_days/τ) where age is the freshest item in the
-    # cluster. τ ≈ 4 days inside the 7-day window. Prevents stale items that
-    # made it in once from re-surfacing past their welcome.
+
+def _dense_exclusion(inputs, medoids):
+    """Highest embedding cosine to any exclusion descriptor, per cluster."""
+    embeddings = inputs["embeddings"]
+    aspects = inputs["exclusion_aspects"]
+    dense = np.zeros(len(medoids))
+    if embeddings is None:
+        return dense
+    aspect_embs = _embed_aspects(aspects, _profile_hash() + "_excl")
+    if aspect_embs is None:
+        return dense
+    medoid_embs = embeddings[medoids]
+    for position in range(len(aspects)):
+        dense = np.maximum(dense, medoid_embs @ aspect_embs[position])
+    return dense
+
+
+def _profile_exclusion(inputs, medoids, bm25):
+    """How strongly each cluster matches the profile's 'not relevant' clause.
+
+    The dense lane is what catches celebrity and consumer-tech leakage where
+    BM25 vocabulary fails. This is a filter input only, never a positive term.
+    """
+    aspects = inputs["exclusion_aspects"]
+    blank = np.zeros(len(medoids))
+    if not aspects:
+        return blank
+    lexical = np.zeros(len(medoids))
+    for label, descriptor in aspects:
+        tokens = _norm(descriptor).split() or _norm(label).split()
+        if not tokens:
+            continue
+        lexical = np.maximum(lexical, _medoid_scores(bm25, medoids, tokens))
+    dense = _dense_exclusion(inputs, medoids)
+    combined = lexical / (lexical.max() + 1e-9) + dense / (dense.max() + 1e-9)
+    if combined.max() > 0:
+        return _normalize(combined)
+    return blank
+
+
+def _persistence(inputs, matched_ids):
+    """Recurrence rate of each cluster's matched bank topic, and its score term.
+
+    Args:
+        inputs: the scoring inputs dictionary.
+        matched_ids: matched bank topic id per cluster, None where unmatched.
+
+    Returns:
+        {"rate": array where -1 means unmatched, "signal": array in [0, 1]}
+    """
+    clusters = inputs["clusters"]
+    bank = inputs["bank"]
+    week = inputs["week"]
+    rate = -np.ones(len(clusters))
+    if not bank:
+        return {"rate": rate, "signal": np.clip(rate, 0.0, 1.0)}
+    by_id = {topic["topic_id"]: topic for topic in bank}
+    for i in range(len(clusters)):
+        topic = by_id.get(matched_ids[i])
+        if topic is None:
+            continue
+        span = max(_weeks_between(week, topic["first_week"]), 1)
+        rate[i] = float(topic["weeks_seen"]) / span
+    signal = np.clip(rate, 0.0, 1.0)
+    if signal.max() > 0:
+        signal = _normalize(signal)
+    return {"rate": rate, "signal": signal}
+
+
+def _source_prior(inputs):
+    items = inputs["items"]
+    means = []
+    for cluster in inputs["clusters"]:
+        priors = [SOURCE_PRIORS.get(items[i]["source"], 1.0) for i in cluster]
+        means.append(np.mean(priors))
+    return _normalize(np.array(means))
+
+
+def _source_breadth(inputs):
+    """Count the distinct outlets covering each cluster, log-scaled."""
+    items = inputs["items"]
+    counts = []
+    for cluster in inputs["clusters"]:
+        sources = {items[i]["source"] for i in cluster}
+        counts.append(float(len(sources)))
+    return _normalize(np.log1p(np.array(counts, dtype=float)))
+
+
+def _recency(inputs):
+    """Decay each cluster by the age of its freshest item, so stale items fade."""
+    items = inputs["items"]
     now = datetime.now(timezone.utc)
-    rec_raw = []
-    for c in clusters:
+    freshness = []
+    for cluster in inputs["clusters"]:
         ages = []
-        for i in c:
+        for i in cluster:
             age = _item_age_days(items[i].get("ts"), now)
             if age is not None:
                 ages.append(age)
-        rec_raw.append(np.exp(-(min(ages) if ages else 0.0) / 4.0))
-    recency = _normalize(np.array(rec_raw, dtype=float))
+        youngest = min(ages) if ages else 0.0
+        freshness.append(np.exp(-youngest / RECENCY_DECAY_DAYS))
+    return _normalize(np.array(freshness, dtype=float))
 
-    signal_arrays = {
-        "coverage": coverage,
-        "prior": prior,
-        "novelty": novelty,
-        "relevance": relevance,
-        "entity_signal": entity_signal,
-        "trend": trend_norm,
-        "richness": richness,
-        "coverage_gap": coverage_gap,
-        "persistence": persistence_signal,
-        "source_breadth": source_breadth,
-        "recency": recency,
+
+def _spotlight_entities(cluster, items, velocities):
+    """Pick the loudest named entities in a cluster for the digest spotlight."""
+    counts = defaultdict(int)
+    for i in cluster:
+        for entity, label in items[i]["entities"].items():
+            if _is_signal_entity(entity, label) and label in _SPOTLIGHT_LABELS:
+                counts[entity] += 1
+    ranked = sorted(
+        counts.items(),
+        key=lambda pair: (pair[1], velocities.get(pair[0], 0.0)),
+        reverse=True,
+    )
+    return ranked[:TOP_ENTITIES_PER_CLUSTER]
+
+
+def _signal_row(signals, exclusion, persistence_rate, position):
+    row = {name: float(arr[position]) for name, arr in signals.items()}
+    row["profile_exclusion"] = float(exclusion[position])
+    row["persistence_rate"] = float(persistence_rate[position])
+    return row
+
+
+def score_clusters(inputs):
+    """Score every cluster with the weighted linear model.
+
+    Args:
+        inputs: one dictionary holding clusters, items, X, vec, velocities,
+            bank, aspects, debt, entity_idf, max_idf, weights, week,
+            exclusion_aspects, and embeddings. embeddings is a normalized dense
+            matrix, or None to score on the lexical lane alone.
+
+    Returns:
+        {"scored": cluster rows sorted best first,
+         "aspect_coverage": per-aspect coverage this week, normalised to [0, 1]}
+    """
+    clusters = inputs["clusters"]
+    items = inputs["items"]
+    medoids = [cluster_medoid(cluster, inputs["X"]) for cluster in clusters]
+    medoid_vecs = sp.vstack([inputs["X"][m] for m in medoids])
+    corpus = [_norm(f"{item['title']} {item['body']}").split() for item in items]
+    bm25 = BM25Okapi(corpus)
+
+    relevance = _lexical_relevance(inputs, medoids, bm25)
+    relevance = relevance + _dense_relevance(inputs, medoids)
+    novelty = _novelty_against_bank(inputs, medoid_vecs)
+    entities = _entity_signals(inputs)
+    gap = _coverage_gap(inputs, medoids, bm25)
+    persistence = _persistence(inputs, novelty["matched_ids"])
+    exclusion = _profile_exclusion(inputs, medoids, bm25)
+
+    sizes = np.array([len(cluster) for cluster in clusters])
+    signals = {
+        "coverage": np.log1p(sizes) / np.log1p(max(sizes.max(), 1)),
+        "prior": _source_prior(inputs),
+        "novelty": novelty["novelty"],
+        "relevance": _normalize(relevance),
+        "entity_signal": entities["entity_signal"],
+        "trend": entities["trend"],
+        "richness": entities["richness"],
+        "coverage_gap": gap["coverage_gap"],
+        "persistence": persistence["signal"],
+        "source_breadth": _source_breadth(inputs),
+        "recency": _recency(inputs),
     }
     score = np.zeros(len(clusters))
-    for k, arr in signal_arrays.items():
-        score = score + weights.get(k, 0.0) * arr
+    for name, arr in signals.items():
+        score = score + inputs["weights"].get(name, 0.0) * arr
 
-    order = np.argsort(-score)
     scored = []
-    for i in order:
+    for i in np.argsort(-score):
         scored.append({
             "idxs": clusters[i],
             "medoid": medoids[i],
             "score": float(score[i]),
             "vec": medoid_vecs[i],
-            "entities": _cluster_top_entities(clusters[i], items, velocities),
+            "entities": _spotlight_entities(clusters[i], items, inputs["velocities"]),
             "sector": classify_sector(clusters[i], items),
             "category": classify_category(clusters[i], items),
-            "matched_topic_id": matched_ids[i],
-            "matched_sim": float(matched_sims[i]),
-            "signals": {
-                **{k: float(arr[i]) for k, arr in signal_arrays.items()},
-                "profile_exclusion": float(profile_exclusion[i]),
-                "persistence_rate": float(persistence_rate[i]),
-            },
+            "matched_topic_id": novelty["matched_ids"][i],
+            "matched_sim": float(novelty["matched_sims"][i]),
+            "signals": _signal_row(signals, exclusion, persistence["rate"], i),
         })
-    return scored, aspect_coverage
+    return {"scored": scored, "aspect_coverage": gap["aspect_coverage"]}
 
 
-def mmr_select(scored, k=15, lam=0.65):
+def mmr_select(scored, k=MMR_SELECT_K, lam=MMR_LAMBDA):
     """Fixed-k MMR. Retained for compatibility; run() now uses
     mmr_dynamic_select to avoid an arbitrary cap."""
     if not scored:
@@ -1381,12 +1748,13 @@ def mmr_select(scored, k=15, lam=0.65):
     return [scored[i] for i in selected]
 
 
-def mmr_dynamic_select(scored, lam=0.65, min_k=8, max_k=40, relevance_floor=0.15):
+def mmr_dynamic_select(scored, lam=MMR_LAMBDA, min_k=MMR_MIN_K, max_k=MMR_MAX_K,
+                       relevance_floor=MMR_RELEVANCE_FLOOR):
     """MMR over the whole qualifying pool, then cut at the score-knee.
 
     Floors at min_k (don't render an empty-looking digest on a quiet week),
     ceilings at max_k (cost / readability guard, rarely binds), and unconditionally
-    keeps any cluster whose relevance signal exceeds relevance_floor — that
+    keeps any cluster whose relevance signal exceeds relevance_floor: that
     preserves the USER_PROFILE link even when the knee falls early."""
     if not scored:
         return []
@@ -1423,7 +1791,7 @@ def mmr_dynamic_select(scored, lam=0.65, min_k=8, max_k=40, relevance_floor=0.15
 
     cut = max(min_k, min(cut, max_k, len(scores)))
 
-    # Always keep clusters above the relevance floor, even past the knee — they
+    # Always keep clusters above the relevance floor, even past the knee, they
     # are on-profile signal we don't want to drop just because the curve broke.
     keep_idxs = set(range(cut))
     for i, c in enumerate(ordered[cut:max_k], start=cut):
@@ -1433,10 +1801,10 @@ def mmr_dynamic_select(scored, lam=0.65, min_k=8, max_k=40, relevance_floor=0.15
     return [ordered[i] for i in sorted(keep_idxs)]
 
 
-def _filter_off_profile(scored, history_weeks, relevance_floor=0.10,
-                        persistence_floor=0.15):
+def _filter_off_profile(scored, history_weeks, relevance_floor=OFF_PROFILE_RELEVANCE_FLOOR,
+                        persistence_floor=OFF_PROFILE_PERSISTENCE_FLOOR):
     """Drop clusters whose profile_exclusion signal exceeds relevance AND
-    whose relevance falls below the floor — Layer A of §2.4.
+    whose relevance falls below the floor. Layer A of §2.4.
 
     Once history_weeks >= 10, the filter tightens with Layer B: a
     high-exclusion cluster also has to clear the persistence floor (its
@@ -1445,7 +1813,7 @@ def _filter_off_profile(scored, history_weeks, relevance_floor=0.10,
     as failing the persistence test only once history is deep enough.
 
     Additionally, clusters below DUMP_RELEVANCE_FLOOR with non-trivial
-    exclusion are dropped regardless of the other gates — these are the
+    exclusion are dropped regardless of the other gates: these are the
     low-signal off-profile items that leak into the ALL STORIES dump.
     On-profile clusters (profile_exclusion == 0.0) are never dropped by
     this secondary gate so the rule cannot suppress genuine coverage.
@@ -1483,8 +1851,8 @@ def _title_signature(title):
     # strip bracketed source tags at start
     t = re.sub(r"^\[[^\]]{1,40}\]\s*", "", t)
     # strip countdown / deadline tails
-    t = re.sub(r"[—\-:|]\s*(?:final|last|only|just)\s+\d+\s*(?:hours?|days?|hrs?)\s+left.*$", "", t, flags=re.I)
-    t = re.sub(r"[—\-:|]\s*(?:early\s+bird|deadline|register|save\s+\$?\d+).*$", "", t, flags=re.I)
+    t = re.sub(r"[\u2014\-:|]\s*(?:final|last|only|just)\s+\d+\s*(?:hours?|days?|hrs?)\s+left.*$", "", t, flags=re.I)
+    t = re.sub(r"[\u2014\-:|]\s*(?:early\s+bird|deadline|register|save\s+\$?\d+).*$", "", t, flags=re.I)
     t = re.sub(r"\d+\s*(?:hours?|days?|hrs?)\s+left.*$", "", t, flags=re.I)
     tokens = _norm(t).split()
     return " ".join(tokens[:8])
@@ -1492,7 +1860,7 @@ def _title_signature(title):
 
 def _dedupe_top(top, items):
     """Cross-cluster dedup. Each URL and each title signature (see
-    _title_signature) appears in at most one cluster — the highest-scoring
+    _title_signature) appears in at most one cluster, the highest-scoring
     one that holds it (top is already in descending-score order). Clusters
     left with zero items are dropped entirely."""
     seen_urls, seen_sigs = set(), set()
@@ -1514,9 +1882,9 @@ def _dedupe_top(top, items):
     return out
 
 
-# ── Claude summarization ──────────────────────────────────────────────────────
+# ---- Claude summarization ----
 
-def _retry(fn, attempts=3, base=2.0):
+def _retry(fn, attempts=RETRY_ATTEMPTS, base=RETRY_BACKOFF_BASE):
     for i in range(attempts):
         try:
             return fn()
@@ -1526,7 +1894,7 @@ def _retry(fn, attempts=3, base=2.0):
             time.sleep(base ** i)
 
 
-# ── macro-trend memory ────────────────────────────────────────────────────────
+# ---- Macro-trend memory ----
 
 def load_macro_context(conn):
     row = conn.execute(
@@ -1561,13 +1929,14 @@ def generate_macro_trends(conn):
     context = "\n\n---\n\n".join(f"Week {r[0]}:\n{r[1]}" for r in rows_to_use)
 
     client = anthropic.Anthropic()
-    msg = _retry(lambda: client.messages.create(
+    request = partial(
+        client.messages.create,
         model="claude-haiku-4-5-20251001",
         max_tokens=600,
         system=(
             "You are a media industry researcher synthesising longitudinal industry data. "
             "Identify structural shifts, market concentration dynamics, and regulatory "
-            "trajectories that span multiple observation periods — not individual events. "
+            "trajectories that span multiple observation periods, not individual events. "
             "Write for an academic and industry professional audience. "
             "Dense, precise prose. Name companies and cite patterns. No hedging."
         ),
@@ -1578,7 +1947,8 @@ def generate_macro_trends(conn):
             "that have persisted, intensified, or shifted across these weeks:\n\n"
             + context
         )}],
-    ))
+    )
+    msg = _retry(request)
 
     macro_text = msg.content[0].text
     month = datetime.now(timezone.utc).strftime("%Y-%m")
@@ -1591,7 +1961,7 @@ def generate_macro_trends(conn):
     return macro_text
 
 
-def get_archive_links(conn, n=8):
+def get_archive_links(conn, n=ARCHIVE_LINKS_COUNT):
     site_bucket = os.environ.get("GCS_SITE_BUCKET", "")
     if not site_bucket:
         return []
@@ -1604,7 +1974,7 @@ def get_archive_links(conn, n=8):
     ]
 
 
-# ── Claude summarization ──────────────────────────────────────────────────────
+# ---- Claude summarization ----
 
 def sectors_present(top):
     """[(sector_key, [clusters])] in SECTOR_ORDER, only sectors with clusters."""
@@ -1614,6 +1984,89 @@ def sectors_present(top):
     return [(s, grouped[s]) for s in SECTOR_ORDER if grouped.get(s)]
 
 
+def _new_category_bucket():
+    return defaultdict(list)
+
+
+def _group_by_sector_category(top):
+    grouped = defaultdict(_new_category_bucket)
+    for cluster in top:
+        sector_key = cluster.get("sector", DEFAULT_SECTOR)
+        category_key = cluster.get("category", DEFAULT_CATEGORY)
+        grouped[sector_key][category_key].append(cluster)
+    return grouped
+
+
+def _cluster_block_lines(cid, cluster, items):
+    """The prompt lines for one numbered cluster: header, body snippet,
+    entities."""
+    title = items[cluster["medoid"]]["title"]
+    # Sentence-level MMR: picks the body sentence that maximises relevance
+    # to USER_PROFILE while penalising overlap with the title the LLM
+    # already sees, instead of a blind body[:240] lede assumption.
+    body = _mmr_sentence(items[cluster["medoid"]].get("body") or "", title, USER_PROFILE)
+    entity_names = " · ".join(entity for entity, _ in cluster["entities"][:4])
+    sources = sorted({items[i]["source"].upper() for i in cluster["idxs"][:5]})
+    lines = [
+        f"{cid} (score {cluster.get('score', 0.0):.2f}, sources "
+        f"{', '.join(sources)}): {title}"
+    ]
+    if body:
+        lines.append(f"   {body}")
+    if entity_names:
+        lines.append(f"   entities: {entity_names}")
+    return lines
+
+
+def _build_cluster_blocks(top, items):
+    """Number every cluster C1, C2, … in sector, then category, then
+    score-descending order, and render one prompt-ready text block per
+    sector.
+
+    Returns:
+        {"blocks": one text block per sector, "cluster_index": {"C1":
+        cluster, ...} so the parser can look picks back up}.
+    """
+    grouped = _group_by_sector_category(top)
+    cluster_index = {}
+    blocks = []
+    counter = 0
+    for sector_key in SECTOR_ORDER:
+        if sector_key not in grouped:
+            continue
+        section_lines = [f"## {SECTORS[sector_key]}"]
+        for category_key, _ in CATEGORIES:
+            if category_key not in grouped[sector_key]:
+                continue
+            category_clusters = sorted(
+                grouped[sector_key][category_key],
+                key=lambda cluster: -cluster.get("score", 0.0),
+            )
+            section_lines.append(f"### {CATEGORY_NAMES[category_key]}")
+            for cluster in category_clusters:
+                counter += 1
+                cid = f"C{counter}"
+                cluster_index[cid] = cluster
+                section_lines.extend(_cluster_block_lines(cid, cluster, items))
+        blocks.append("\n".join(section_lines))
+    return {"blocks": blocks, "cluster_index": cluster_index}
+
+
+def _summarise_body_instructions(blocks, longitudinal_context, macro_context):
+    long_section = f"\n\n{longitudinal_context}\n" if longitudinal_context else ""
+    macro_section = (
+        "\n\nMacro context from prior weeks (structural trends; cite when "
+        f"relevant):\n{macro_context}\n" if macro_context else ""
+    )
+    return (
+        SUMMARISE_BODY_PREAMBLE
+        + long_section
+        + macro_section
+        + "\n\nClusters this week:\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
 def summarise(top, items, macro_context=None, history_depth="warmup",
               longitudinal_context=None):
     """Editorial spotlight: ask the LLM to pick up to 5 most meaningful
@@ -1621,123 +2074,39 @@ def summarise(top, items, macro_context=None, history_depth="warmup",
     referenced by the cluster's `Cn` index so the renderer can attach
     the real article links.
 
-    Returns ``(summary_text, cluster_index)`` where cluster_index maps
-    "C1", "C2", … to the cluster dicts the LLM saw. The renderer uses
-    this to look picks back up.
-
     ``history_depth`` is retained for symmetry but no longer drives the
-    output format — longitudinal_context being non-empty is what unlocks
+    output format: longitudinal_context being non-empty is what unlocks
     multi-week framing in the LLM's prose.
+
+    Returns:
+        {"summary": the LLM's raw text, "cluster_index": {"C1": cluster,
+        ...} mapping every Cn the LLM saw back to its cluster dict}.
     """
+    built = _build_cluster_blocks(top, items)
+    body_instructions = _summarise_body_instructions(
+        built["blocks"], longitudinal_context, macro_context
+    )
+
     client = anthropic.Anthropic()
-
-    # Group clusters by (sector, category) and number them C1, C2, … in
-    # sector → category → score-descending order. The numbering is global
-    # so a Cn never collides across categories.
-    by_sector_cat = defaultdict(lambda: defaultdict(list))
-    for c in top:
-        sk = c.get("sector", DEFAULT_SECTOR)
-        ck = c.get("category", DEFAULT_CATEGORY)
-        by_sector_cat[sk][ck].append(c)
-
-    cluster_index = {}
-    blocks = []
-    counter = 0
-    for sector_key in SECTOR_ORDER:
-        if sector_key not in by_sector_cat:
-            continue
-        section_lines = [f"## {SECTORS[sector_key]}"]
-        for cat_key, _ in CATEGORIES:
-            if cat_key not in by_sector_cat[sector_key]:
-                continue
-            cat_clusters = sorted(
-                by_sector_cat[sector_key][cat_key],
-                key=lambda c: -c.get("score", 0.0),
-            )
-            section_lines.append(f"### {CATEGORY_NAMES[cat_key]}")
-            for c in cat_clusters:
-                counter += 1
-                cid = f"C{counter}"
-                cluster_index[cid] = c
-                title = items[c["medoid"]]["title"]
-                # Sentence-level MMR (replaces blind [:240] lede assumption).
-                # Picks the body sentence that maximises relevance to
-                # USER_PROFILE while penalising overlap with the title the
-                # LLM already sees.
-                body = _mmr_sentence(
-                    items[c["medoid"]].get("body") or "",
-                    title,
-                    USER_PROFILE,
-                )
-                ents = " · ".join(e for e, _ in c["entities"][:4])
-                srcs = sorted({items[i]["source"].upper() for i in c["idxs"][:5]})
-                section_lines.append(
-                    f"{cid} (score {c.get('score', 0.0):.2f}, sources "
-                    f"{', '.join(srcs)}): {title}"
-                )
-                if body:
-                    section_lines.append(f"   {body}")
-                if ents:
-                    section_lines.append(f"   entities: {ents}")
-        blocks.append("\n".join(section_lines))
-
-    long_section = (
-        f"\n\n{longitudinal_context}\n" if longitudinal_context else ""
-    )
-    macro_section = (
-        "\n\nMacro context from prior weeks (structural trends; cite when "
-        f"relevant):\n{macro_context}\n" if macro_context else ""
-    )
-
-    system_prompt = (
-        "You are a media industry researcher curating an editorial spotlight "
-        "for an audience of industry professionals and academics.\n\n"
-        "STRICT anti-patterns:\n"
-        "- Do NOT open with abstract claims about markets shifting, "
-        "industries transforming, or sectors evolving. Lead with the named "
-        "entity, deal, figure, or regulator.\n"
-        "- Do NOT invent streaks, returns, or multi-week patterns. Only "
-        "cite longitudinal context that is explicitly listed in the prompt.\n"
-        "- Do NOT reference a Cn that you did not pick, and do not "
-        "invent a Cn that does not appear in the source clusters.\n\n"
-        "Each pick: 1–3 sentences. Lead with the concrete observable, then "
-        "the structural implication. Cite companies and figures precisely. "
-        "No hedging. No filler."
-    )
-
-    body_instructions = (
-        "Below are clustered stories grouped by sector (## heading) and "
-        "category (### heading). Each cluster is numbered C{n} with its "
-        "score, source list, headline, body snippet, and top entities. "
-        "Clusters within each category are listed in descending score "
-        "order — the first is the highest-scoring.\n\n"
-        "For each (sector, category) you find meaningful, pick UP TO 5 "
-        "clusters to spotlight, ordered by your editorial judgement of "
-        "importance. Skip a category entirely if nothing rises above noise. "
-        "Skip a sector entirely if all its categories are skipped.\n\n"
-        "Output strictly:\n\n"
-        "## SectorName (display name as shown below)\n"
-        "### CategoryName (display name as shown below)\n"
-        "- C{n}: 1–3 sentence editorial summary.\n"
-        "- C{m}: 1–3 sentence editorial summary.\n\n"
-        "Repeat per sector and per category. Preserve each Cn reference "
-        "exactly — the renderer parses it to attach links."
-        + long_section
-        + macro_section
-        + "\n\nClusters this week:\n\n"
-        + "\n\n".join(blocks)
-    )
-
-    msg = _retry(lambda: client.messages.create(
+    request = partial(
+        client.messages.create,
         model="claude-haiku-4-5-20251001",
         max_tokens=2400,
-        system=system_prompt,
+        system=SUMMARISE_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": body_instructions}],
-    ))
-    return msg.content[0].text, cluster_index
+    )
+    msg = _retry(request)
+    return {"summary": msg.content[0].text, "cluster_index": built["cluster_index"]}
 
 
 _CN_RE = re.compile(r"^-\s*(C\d+)\s*:\s*(.+)$", re.IGNORECASE)
+
+
+def _match_category(cat_name):
+    for category_key, name in CATEGORIES:
+        if name.lower() == cat_name.lower():
+            return category_key
+    return None
 
 
 def parse_spotlight(summary, cluster_index):
@@ -1750,7 +2119,7 @@ def parse_spotlight(summary, cluster_index):
     dropped; a Cn that isn't in cluster_index is dropped; pure prose lines
     between bullets are ignored. The cluster ordering within each category
     is preserved (the LLM's editorial sequence)."""
-    out = defaultdict(lambda: defaultdict(list))
+    out = defaultdict(_new_category_bucket)
     sector_key = None
     category_key = None
     seen_cids = set()
@@ -1759,16 +2128,12 @@ def parse_spotlight(summary, cluster_index):
         if not s:
             continue
         if s.startswith("## "):
-            sector_key = _sector_key_for_title(s[3:].strip())
+            title = s[3:].strip()
+            sector_key = _SECTOR_NAME_TO_KEY.get(title.lower()) if title else None
             category_key = None
             continue
         if s.startswith("### "):
-            cat_name = s[4:].strip()
-            category_key = None
-            for ck, name in CATEGORIES:
-                if name.lower() == cat_name.lower():
-                    category_key = ck
-                    break
+            category_key = _match_category(s[4:].strip())
             continue
         m = _CN_RE.match(s.lstrip())
         if not m or sector_key is None or category_key is None:
@@ -1784,86 +2149,17 @@ def parse_spotlight(summary, cluster_index):
     return out
 
 
-def split_summary_sections(summary):
-    """Legacy parser kept for callers that just want '## Sector' chunks
-    (currently unused after the spotlight refactor)."""
-    sections, title, body = [], None, []
-    for line in summary.splitlines():
-        if line.startswith("## "):
-            if title or body:
-                sections.append((title, "\n".join(body).strip()))
-            title, body = line[3:].strip(), []
-        else:
-            body.append(line)
-    if title or body:
-        sections.append((title, "\n".join(body).strip()))
-    return [(t, b) for t, b in sections if b] or [(None, summary.strip())]
-
-
 # Reverse-lookup from a sector display name back to its SECTOR_ORDER key, so
 # render_static/render_email can match an LLM-emitted "## SectorName" heading
 # to the cluster bucket for that sector. Case-insensitive, ignores whitespace.
 _SECTOR_NAME_TO_KEY = {v.strip().lower(): k for k, v in SECTORS.items()}
 
 
-def _sector_key_for_title(title):
-    if not title:
-        return None
-    return _SECTOR_NAME_TO_KEY.get(title.strip().lower())
-
-
-def _bullet_lines(body):
-    """Pull out lines that look like list bullets (`- ...` / `* ...` /
-    `• ...`), one per element. Strips the bullet marker. Returns [] if the
-    body is paragraph-shaped instead."""
-    out = []
-    for raw in (body or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if line.startswith(("- ", "* ", "• ")):
-            out.append(line[2:].strip())
-        elif line[:2] in ("-\t", "*\t"):
-            out.append(line[2:].strip())
-    return out
-
-
-def _summary_section_html(body, *, ul_class="sector-summary",
-                          paragraph_class="ssec-para"):
-    """Render a parsed summary section body as either a bullet <ul> (preferred,
-    matches the new bullet-format prompts) or — if the LLM ignored the bullet
-    instruction — a paragraph fallback so the digest still renders."""
-    bullets = _bullet_lines(body)
-    if bullets:
-        items = "".join(f"<li>{b}</li>" for b in bullets)
-        return f'<ul class="{ul_class}">{items}</ul>'
-    paras = "".join(
-        f'<p class="{paragraph_class}">{p.strip()}</p>'
-        for p in (body or "").split("\n\n") if p.strip()
-    )
-    return paras
-
-
-def _summary_by_sector_key(summary):
-    """{sector_key: html_block} from the LLM summary, keyed by SECTOR_ORDER key.
-
-    Unmatched section titles (LLM emitted a name that doesn't map to SECTORS)
-    are dropped silently — the renderer falls back to "no summary for this
-    sector" rather than rendering an orphaned block above the wrong stories."""
-    out = {}
-    for title, body in split_summary_sections(summary):
-        key = _sector_key_for_title(title)
-        if key is None or not body:
-            continue
-        out[key] = _summary_section_html(body)
-    return out
-
-
-def _cluster_distinct_links(c, items, cap=5):
+def _cluster_distinct_links(c, items, cap=CLUSTER_LINKS_CAP):
     """Distinct (url, source, title) tuples within a cluster, preserving
     original ordering of c['idxs'] and capped at `cap`. Used by render_*
     to decide singleton vs multi-link layout AND to render the actual link
-    list — single source of truth."""
+    list, the single source of truth."""
     seen = set()
     out = []
     for i in c["idxs"]:
@@ -1877,13 +2173,18 @@ def _cluster_distinct_links(c, items, cap=5):
     return out
 
 
-# ── email output ──────────────────────────────────────────────────────────────
+# ---- Email output ----
 
 def _sector_breakdown(sector_clusters, picks_for_sector):
-    """Helper: split a sector's clusters into spotlit (with LLM summary)
-    and dump (by category, score-descending). Used by both renderers."""
+    """Split a sector's clusters into spotlit (with an LLM summary) and
+    dump (by category, score-descending). Shared by both renderers.
+
+    Returns:
+        {"spotlight": {category_key: [(cluster, summary_text), ...]},
+        "dump": {category_key: [cluster, ...]}}.
+    """
     spotlit_ids = set()
-    spotlight_by_cat = defaultdict(list)  # {cat_key: [(cluster, summary_text)]}
+    spotlight_by_cat = defaultdict(list)
     for cat_key, picks in (picks_for_sector or {}).items():
         for cluster, summary_text in picks:
             if id(cluster) in spotlit_ids:
@@ -1891,124 +2192,146 @@ def _sector_breakdown(sector_clusters, picks_for_sector):
             spotlit_ids.add(id(cluster))
             spotlight_by_cat[cat_key].append((cluster, summary_text))
     dump_by_cat = defaultdict(list)
-    for c in sector_clusters:
-        if id(c) in spotlit_ids:
+    for cluster in sector_clusters:
+        if id(cluster) in spotlit_ids:
             continue
-        dump_by_cat[c.get("category", DEFAULT_CATEGORY)].append(c)
+        dump_by_cat[cluster.get("category", DEFAULT_CATEGORY)].append(cluster)
     for cat_key in list(dump_by_cat.keys()):
-        dump_by_cat[cat_key].sort(key=lambda c: -c.get("score", 0.0))
-    return spotlight_by_cat, dump_by_cat
+        dump_by_cat[cat_key].sort(key=lambda cluster: -cluster.get("score", 0.0))
+    return {"spotlight": spotlight_by_cat, "dump": dump_by_cat}
+
+
+def _email_link_line(url, source, title, also=False):
+    if also:
+        return f'<br>↳ <a href="{url}" style="color:#666"><b>{source.upper()}:</b> {title}</a>'
+    return f'↳ <a href="{url}"><b>{source.upper()}:</b> {title}</a>'
+
+
+def _render_email_spotlight_item(cluster, summary_text, items):
+    links = _cluster_distinct_links(cluster, items, cap=CLUSTER_LINKS_CAP)
+    if not links:
+        return ""
+    parts = [
+        "<li style='margin-bottom:10px'>"
+        f"<div style='color:#111;font-size:14px'>{summary_text}</div>"
+        "<div style='font-size:12px;margin-top:4px'>"
+    ]
+    url, source, title = links[0]
+    parts.append(_email_link_line(url, source, title))
+    for url, source, title in links[1:]:
+        parts.append(_email_link_line(url, source, title, also=True))
+    parts.append("</div></li>")
+    return "".join(parts)
+
+
+def _render_email_spotlight(spotlight_by_cat, items):
+    """SPOTLIGHT section: LLM-picked stories, grouped by category."""
+    parts = []
+    for cat_key, _ in CATEGORIES:
+        if cat_key not in spotlight_by_cat:
+            continue
+        parts.append(
+            f"<h4 style='color:#60a5fa;font-size:12px;text-transform:"
+            f"uppercase;letter-spacing:.05em;margin:14px 0 6px'>"
+            f"{CATEGORY_NAMES[cat_key]}</h4>"
+        )
+        parts.append("<ul style='margin:0 0 8px;padding-left:18px'>")
+        for cluster, summary_text in spotlight_by_cat[cat_key]:
+            parts.append(_render_email_spotlight_item(cluster, summary_text, items))
+        parts.append("</ul>")
+    return "\n".join(parts)
+
+
+def _render_email_dump_item(cluster, items):
+    links = _cluster_distinct_links(cluster, items, cap=SECTION_DUMP_LINKS_CAP)
+    if not links:
+        return ""
+    parts = []
+    url, source, title = links[0]
+    parts.append(
+        f'<li style="margin-bottom:3px;font-size:13px">'
+        f'<a href="{url}"><b>{source.upper()}:</b> {title}</a>'
+    )
+    for url, source, title in links[1:]:
+        parts.append(
+            f'<br><span style="font-size:12px;color:#666">↳ '
+            f'<a href="{url}" style="color:#666"><b>{source.upper()}:</b> '
+            f'{title}</a></span>'
+        )
+    parts.append("</li>")
+    return "".join(parts)
+
+
+def _render_email_dump(dump_by_cat, items):
+    """DUMP section: mechanical listing, grouped by category, score-descending."""
+    parts = [
+        "<div style='color:#888;font-size:11px;text-transform:uppercase;"
+        "letter-spacing:.05em;margin-bottom:6px'>All stories</div>"
+    ]
+    for cat_key, _ in CATEGORIES:
+        if cat_key not in dump_by_cat:
+            continue
+        cat_clusters = dump_by_cat[cat_key]
+        parts.append(
+            f"<div style='color:#444;font-size:11px;margin:10px 0 4px;"
+            f"font-weight:600'>{CATEGORY_NAMES[cat_key]} "
+            f"<span style='color:#888;font-weight:400'>"
+            f"({len(cat_clusters)})</span></div>"
+        )
+        parts.append("<ul style='margin:0 0 6px;padding-left:18px'>")
+        for cluster in cat_clusters:
+            parts.append(_render_email_dump_item(cluster, items))
+        parts.append("</ul>")
+    return "\n".join(parts)
+
+
+def _render_email_sector(sector_key, sector_clusters, picks_for_sector, items):
+    breakdown = _sector_breakdown(sector_clusters, picks_for_sector)
+    spotlight_by_cat, dump_by_cat = breakdown["spotlight"], breakdown["dump"]
+
+    parts = [
+        f"<h3 style='border-bottom:1px solid #ddd;padding-bottom:4px;"
+        f"margin-top:28px;color:#f59e0b'>{SECTORS[sector_key]} "
+        f"<small style='color:#888;font-weight:400'>"
+        f"({len(sector_clusters)} stories)</small></h3>"
+    ]
+    if spotlight_by_cat:
+        parts.append(_render_email_spotlight(spotlight_by_cat, items))
+    if spotlight_by_cat and dump_by_cat:
+        parts.append("<hr style='border:none;border-top:1px dashed #ccc;margin:14px 0'>")
+    if dump_by_cat:
+        parts.append(_render_email_dump(dump_by_cat, items))
+    return "\n".join(parts)
+
+
+def _render_email_macro(macro):
+    month_label = datetime.now().strftime("%B %Y")
+    paragraph_style = "color:#aaa;font-size:13px;border-left:2px solid #444;padding-left:12px"
+    body = macro.replace("\n\n", f"</p><p style='{paragraph_style}'>")
+    return (
+        f"<h3 style='color:#888;font-size:13px;margin-top:24px'>"
+        f"Macro Trends: {month_label}</h3>"
+        f"<p style='{paragraph_style}'>{body}</p>"
+    )
 
 
 def render_email(summary, cluster_index, top, items, macro=None):
     date_str = datetime.now().strftime("%b %d, %Y")
-    parts = [f"<h2>Weekly Media Industry News — {date_str}</h2>"]
-
     picks = parse_spotlight(summary, cluster_index)
 
+    parts = [f"<h2>Weekly Media Industry News: {date_str}</h2>"]
     for sector_key, sector_clusters in sectors_present(top):
-        parts.append(
-            f"<h3 style='border-bottom:1px solid #ddd;padding-bottom:4px;"
-            f"margin-top:28px;color:#f59e0b'>{SECTORS[sector_key]} "
-            f"<small style='color:#888;font-weight:400'>"
-            f"({len(sector_clusters)} stories)</small></h3>"
-        )
-
-        spotlight_by_cat, dump_by_cat = _sector_breakdown(
-            sector_clusters, picks.get(sector_key, {})
-        )
-
-        # SPOTLIGHT — LLM-picked, grouped by category
-        for cat_key, _ in CATEGORIES:
-            if cat_key not in spotlight_by_cat:
-                continue
-            parts.append(
-                f"<h4 style='color:#60a5fa;font-size:12px;text-transform:"
-                f"uppercase;letter-spacing:.05em;margin:14px 0 6px'>"
-                f"{CATEGORY_NAMES[cat_key]}</h4>"
-            )
-            parts.append("<ul style='margin:0 0 8px;padding-left:18px'>")
-            for cluster, summary_text in spotlight_by_cat[cat_key]:
-                links = _cluster_distinct_links(cluster, items, cap=5)
-                if not links:
-                    continue
-                parts.append(
-                    f"<li style='margin-bottom:10px'>"
-                    f"<div style='color:#111;font-size:14px'>{summary_text}</div>"
-                    f"<div style='font-size:12px;margin-top:4px'>"
-                )
-                url, src, title = links[0]
-                parts.append(
-                    f'↳ <a href="{url}"><b>{src.upper()}:</b> {title}</a>'
-                )
-                for u, s, t in links[1:]:
-                    parts.append(
-                        f'<br>↳ <a href="{u}" style="color:#666"><b>{s.upper()}:</b> {t}</a>'
-                    )
-                parts.append("</div></li>")
-            parts.append("</ul>")
-
-        # SEPARATOR between spotlight and dump (only if both present)
-        if spotlight_by_cat and dump_by_cat:
-            parts.append(
-                "<hr style='border:none;border-top:1px dashed #ccc;margin:14px 0'>"
-            )
-
-        # DUMP — mechanical, grouped by category, score-descending
-        if dump_by_cat:
-            parts.append(
-                "<div style='color:#888;font-size:11px;text-transform:uppercase;"
-                "letter-spacing:.05em;margin-bottom:6px'>All stories</div>"
-            )
-            for cat_key, _ in CATEGORIES:
-                if cat_key not in dump_by_cat:
-                    continue
-                cat_clusters = dump_by_cat[cat_key]
-                parts.append(
-                    f"<div style='color:#444;font-size:11px;margin:10px 0 4px;"
-                    f"font-weight:600'>{CATEGORY_NAMES[cat_key]} "
-                    f"<span style='color:#888;font-weight:400'>"
-                    f"({len(cat_clusters)})</span></div>"
-                )
-                parts.append("<ul style='margin:0 0 6px;padding-left:18px'>")
-                for c in cat_clusters:
-                    links = _cluster_distinct_links(c, items, cap=4)
-                    if not links:
-                        continue
-                    url, src, title = links[0]
-                    parts.append(
-                        f'<li style="margin-bottom:3px;font-size:13px">'
-                        f'<a href="{url}"><b>{src.upper()}:</b> {title}</a>'
-                    )
-                    for u, s, t in links[1:]:
-                        parts.append(
-                            f'<br><span style="font-size:12px;color:#666">↳ '
-                            f'<a href="{u}" style="color:#666"><b>{s.upper()}:</b> '
-                            f'{t}</a></span>'
-                        )
-                    parts.append("</li>")
-                parts.append("</ul>")
-
+        parts.append(_render_email_sector(
+            sector_key, sector_clusters, picks.get(sector_key, {}), items
+        ))
     if macro:
-        month_label = datetime.now().strftime("%B %Y")
-        parts.append(
-            f"<h3 style='color:#888;font-size:13px;margin-top:24px'>"
-            f"Macro Trends — {month_label}</h3>"
-        )
-        parts.append(
-            "<p style='color:#aaa;font-size:13px;border-left:2px solid #444;"
-            "padding-left:12px'>"
-            + macro.replace("\n\n", "</p><p style='color:#aaa;font-size:13px;"
-                            "border-left:2px solid #444;padding-left:12px'>")
-            + "</p>"
-        )
-
+        parts.append(_render_email_macro(macro))
     return "\n".join(parts)
 
 
 def send_email(html):
     msg = MIMEText(html, "html")
-    msg["Subject"] = f"Weekly Media Industry News — {datetime.now().strftime('%b %d')}"
+    msg["Subject"] = f"Weekly Media Industry News: {datetime.now().strftime('%b %d')}"
     msg["From"] = os.environ["SMTP_FROM"]
     msg["To"] = os.environ["DIGEST_TO"]
     with smtplib.SMTP_SSL(os.environ["SMTP_HOST"], 465) as s:
@@ -2016,189 +2339,187 @@ def send_email(html):
         s.send_message(msg)
 
 
-# ── static site ───────────────────────────────────────────────────────────────
+# ---- Static site ----
 
-def render_static(summary, cluster_index, top, items, week, macro=None,
-                  archive_links=None):
-    date_str = datetime.now().strftime("%B %d, %Y")
-
-    picks = parse_spotlight(summary, cluster_index)
-
-    sector_blocks_html = []
-    for sector_key, sector_clusters in sectors_present(top):
-        spotlight_by_cat, dump_by_cat = _sector_breakdown(
-            sector_clusters, picks.get(sector_key, {})
+def _static_spotlight_item_html(cluster, summary_text, items):
+    links = _cluster_distinct_links(cluster, items, cap=CLUSTER_LINKS_CAP)
+    if not links:
+        return ""
+    parts = []
+    primary_url, primary_src, primary_title = links[0]
+    parts.append(
+        f'<li class="spot-item">'
+        f'<div class="spot-summary">{summary_text}</div>'
+        f'<div class="spot-links">'
+        f'<a href="{primary_url}" target="_blank">'
+        f'<span class="src">{primary_src.upper()}</span> '
+        f'{primary_title}</a>'
+    )
+    for url, source, title in links[1:]:
+        parts.append(
+            f'<div class="also">↳ <a href="{url}" target="_blank">'
+            f'<span class="src">{source.upper()}</span> {title}</a></div>'
         )
-        block = [
-            f'<section class="sec">'
-            f'<h2 class="sector">{SECTORS[sector_key]} '
-            f'<span class="sn">{len(sector_clusters)} stories</span></h2>'
-        ]
+    parts.append('</div></li>')
+    return "".join(parts)
 
-        # SPOTLIGHT
-        if spotlight_by_cat:
-            spot_html = ['<div class="spotlight">']
-            for cat_key, _ in CATEGORIES:
-                if cat_key not in spotlight_by_cat:
-                    continue
-                spot_html.append(
-                    f'<h3 class="cat-block">{CATEGORY_NAMES[cat_key]}</h3>'
-                )
-                spot_html.append('<ul class="spotlight-list">')
-                for cluster, summary_text in spotlight_by_cat[cat_key]:
-                    links = _cluster_distinct_links(cluster, items, cap=5)
-                    if not links:
-                        continue
-                    primary_url, primary_src, primary_title = links[0]
-                    spot_html.append(
-                        f'<li class="spot-item">'
-                        f'<div class="spot-summary">{summary_text}</div>'
-                        f'<div class="spot-links">'
-                        f'<a href="{primary_url}" target="_blank">'
-                        f'<span class="src">{primary_src.upper()}</span> '
-                        f'{primary_title}</a>'
-                    )
-                    for u, s, t in links[1:]:
-                        spot_html.append(
-                            f'<div class="also">↳ <a href="{u}" target="_blank">'
-                            f'<span class="src">{s.upper()}</span> {t}</a></div>'
-                        )
-                    spot_html.append('</div></li>')
-                spot_html.append('</ul>')
-            spot_html.append('</div>')
-            block.append("".join(spot_html))
 
-        # SEPARATOR
-        if spotlight_by_cat and dump_by_cat:
-            block.append('<hr class="sep">')
+def _static_spotlight_html(spotlight_by_cat, items):
+    parts = ['<div class="spotlight">']
+    for cat_key, _ in CATEGORIES:
+        if cat_key not in spotlight_by_cat:
+            continue
+        parts.append(f'<h3 class="cat-block">{CATEGORY_NAMES[cat_key]}</h3>')
+        parts.append('<ul class="spotlight-list">')
+        for cluster, summary_text in spotlight_by_cat[cat_key]:
+            parts.append(_static_spotlight_item_html(cluster, summary_text, items))
+        parts.append('</ul>')
+    parts.append('</div>')
+    return "".join(parts)
 
-        # DUMP
-        if dump_by_cat:
-            dump_html = [
-                '<div class="dump">',
-                '<h4 class="dump-header">All stories</h4>',
-            ]
-            for cat_key, _ in CATEGORIES:
-                if cat_key not in dump_by_cat:
-                    continue
-                cat_clusters = dump_by_cat[cat_key]
-                dump_html.append(
-                    f'<h5 class="dump-cat">{CATEGORY_NAMES[cat_key]} '
-                    f'<span class="sn">{len(cat_clusters)}</span></h5>'
-                )
-                dump_html.append('<ul class="dump-list">')
-                for c in cat_clusters:
-                    links = _cluster_distinct_links(c, items, cap=4)
-                    if not links:
-                        continue
-                    primary_url, primary_src, primary_title = links[0]
-                    dump_html.append(
-                        f'<li>'
-                        f'<a href="{primary_url}" target="_blank">'
-                        f'<span class="src">{primary_src.upper()}</span> '
-                        f'{primary_title}</a>'
-                    )
-                    for u, s, t in links[1:]:
-                        dump_html.append(
-                            f'<div class="also">↳ <a href="{u}" target="_blank">'
-                            f'<span class="src">{s.upper()}</span> {t}</a></div>'
-                        )
-                    dump_html.append('</li>')
-                dump_html.append('</ul>')
-            dump_html.append('</div>')
-            block.append("".join(dump_html))
 
-        block.append('</section>')
-        sector_blocks_html.append("".join(block))
-
-    macro_section = ""
-    if macro:
-        month_label = datetime.now().strftime("%B %Y")
-        macro_html = "".join(
-            f"<p>{p.strip()}</p>" for p in macro.split("\n\n") if p.strip()
+def _static_dump_item_html(cluster, items):
+    links = _cluster_distinct_links(cluster, items, cap=SECTION_DUMP_LINKS_CAP)
+    if not links:
+        return ""
+    parts = []
+    primary_url, primary_src, primary_title = links[0]
+    parts.append(
+        f'<li>'
+        f'<a href="{primary_url}" target="_blank">'
+        f'<span class="src">{primary_src.upper()}</span> '
+        f'{primary_title}</a>'
+    )
+    for url, source, title in links[1:]:
+        parts.append(
+            f'<div class="also">↳ <a href="{url}" target="_blank">'
+            f'<span class="src">{source.upper()}</span> {title}</a></div>'
         )
-        macro_section = (
-            f'<section class="macro">'
-            f'<h2>Macro Trends &mdash; {month_label}</h2>'
-            f'<div class="macro-body">{macro_html}</div>'
-            f'</section>'
-        )
+    parts.append('</li>')
+    return "".join(parts)
 
-    archive_section = ""
-    if archive_links:
-        links_html = "".join(
-            f'<li><a href="{url}">{wk}</a></li>' for wk, url in archive_links
-        )
-        archive_section = f'<nav class="archive"><h2>Archive</h2><ul>{links_html}</ul></nav>'
 
+def _static_dump_html(dump_by_cat, items):
+    parts = ['<div class="dump">', '<h4 class="dump-header">All stories</h4>']
+    for cat_key, _ in CATEGORIES:
+        if cat_key not in dump_by_cat:
+            continue
+        cat_clusters = dump_by_cat[cat_key]
+        parts.append(
+            f'<h5 class="dump-cat">{CATEGORY_NAMES[cat_key]} '
+            f'<span class="sn">{len(cat_clusters)}</span></h5>'
+        )
+        parts.append('<ul class="dump-list">')
+        for cluster in cat_clusters:
+            parts.append(_static_dump_item_html(cluster, items))
+        parts.append('</ul>')
+    parts.append('</div>')
+    return "".join(parts)
+
+
+def _static_sector_block(sector_key, sector_clusters, picks_for_sector, items):
+    breakdown = _sector_breakdown(sector_clusters, picks_for_sector)
+    spotlight_by_cat, dump_by_cat = breakdown["spotlight"], breakdown["dump"]
+
+    block = [
+        f'<section class="sec">'
+        f'<h2 class="sector">{SECTORS[sector_key]} '
+        f'<span class="sn">{len(sector_clusters)} stories</span></h2>'
+    ]
+    if spotlight_by_cat:
+        block.append(_static_spotlight_html(spotlight_by_cat, items))
+    if spotlight_by_cat and dump_by_cat:
+        block.append('<hr class="sep">')
+    if dump_by_cat:
+        block.append(_static_dump_html(dump_by_cat, items))
+    block.append('</section>')
+    return "".join(block)
+
+
+def _static_macro_section(macro):
+    if not macro:
+        return ""
+    month_label = datetime.now().strftime("%B %Y")
+    macro_html = "".join(
+        f"<p>{paragraph.strip()}</p>" for paragraph in macro.split("\n\n") if paragraph.strip()
+    )
+    return (
+        f'<section class="macro">'
+        f'<h2>Macro Trends: {month_label}</h2>'
+        f'<div class="macro-body">{macro_html}</div>'
+        f'</section>'
+    )
+
+
+def _static_archive_section(archive_links):
+    if not archive_links:
+        return ""
+    links_html = "".join(
+        f'<li><a href="{url}">{wk}</a></li>' for wk, url in archive_links
+    )
+    return f'<nav class="archive"><h2>Archive</h2><ul>{links_html}</ul></nav>'
+
+
+def _static_page_shell(page):
+    """Wrap the rendered sections in the full HTML document.
+
+    Args:
+        page: {"date_str", "week", "story_count", "sector_html", "macro_section",
+        "archive_section"}.
+    """
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Weekly Media Industry News — {date_str}</title>
+<title>Weekly Media Industry News: {page["date_str"]}</title>
 <style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{background:#0d0d0d;color:#e5e5e5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:15px;line-height:1.65;padding:0 16px 64px;max-width:860px;margin:0 auto}}
-a{{color:#f59e0b;text-decoration:none}}a:hover{{text-decoration:underline}}
-header{{border-bottom:2px solid #f59e0b;padding:24px 0 14px;margin-bottom:28px}}
-header h1{{font-size:clamp(18px,4vw,28px);letter-spacing:.02em;color:#f59e0b}}
-.wk{{color:#555;font-size:12px;margin-top:4px}}
-.macro{{background:#0e0e14;border-left:3px solid #6366f1;padding:16px 20px;border-radius:4px;margin:28px 0}}
-.macro h2{{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:#6366f1;margin-bottom:12px}}
-.macro-body p{{color:#9ca3af;font-size:14px;margin-bottom:8px;line-height:1.6}}
-.macro-body p:last-child{{margin-bottom:0}}
-h2{{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:#444;margin:28px 0 14px}}
-h2.sector{{font-size:18px;text-transform:none;letter-spacing:.01em;color:#f59e0b;border-bottom:1px solid #2a2a2a;padding-bottom:6px;margin:36px 0 12px;font-weight:600}}
-h2.sector .sn{{color:#555;font-size:12px;font-weight:400;margin-left:8px}}
-/* SPOTLIGHT — LLM editorial picks, grouped by category */
-.spotlight{{margin:6px 0 12px}}
-.spotlight h3.cat-block{{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#60a5fa;margin:14px 0 6px;border:none;padding:0;font-weight:600}}
-ul.spotlight-list{{list-style:none;padding:0;margin:0 0 10px}}
-ul.spotlight-list li.spot-item{{padding:8px 0;border-top:1px solid #1a1a1a}}
-ul.spotlight-list li.spot-item:first-child{{border-top:none}}
-.spot-summary{{color:#e5e5e5;font-size:14.5px;line-height:1.55;margin-bottom:6px}}
-.spot-links{{font-size:13px;color:#aaa;padding-left:2px}}
-.spot-links a{{color:#e5e5e5}}
-.spot-links .also{{font-size:12.5px;color:#888;margin-top:2px;padding-left:8px}}
-.spot-links .also a{{color:#bbb}}
-
-/* SEPARATOR between spotlight and dump */
-hr.sep{{border:none;border-top:1px dashed #2a2a2a;margin:14px 0 10px}}
-
-/* DUMP — mechanical, category-grouped, score-descending */
-.dump h4.dump-header{{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:#666;margin:4px 0 8px;font-weight:600;border:none;padding:0}}
-.dump h5.dump-cat{{font-size:11px;color:#888;margin:10px 0 4px;font-weight:600}}
-.dump h5.dump-cat .sn{{color:#555;font-weight:400;font-size:10.5px;margin-left:4px}}
-ul.dump-list{{list-style:none;padding:0;margin:0 0 6px}}
-ul.dump-list li{{border-top:1px solid #161616;padding:5px 0;font-size:12.5px;line-height:1.45;color:#999}}
-ul.dump-list li:first-child{{border-top:none}}
-ul.dump-list li a{{color:#cfcfcf}}
-ul.dump-list li .also{{font-size:11.5px;color:#666;padding-left:8px;margin-top:1px}}
-ul.dump-list li .also a{{color:#999}}
-
-.src{{color:#f59e0b;font-size:10px;font-weight:700;margin-right:6px;letter-spacing:.02em}}
-.archive{{margin-top:48px;padding-top:24px;border-top:1px solid #1a1a1a}}
-.archive h2{{margin-bottom:10px}}
-.archive ul{{display:flex;flex-wrap:wrap;gap:8px}}
-.archive li{{border:none;padding:0}}
-.archive a{{font-size:12px;color:#555;border:1px solid #222;padding:3px 10px;border-radius:4px}}
-.archive a:hover{{color:#f59e0b;border-color:#f59e0b}}
-footer{{margin-top:32px;color:#333;font-size:11px;text-align:center}}
-@media(max-width:580px){{.ch{{flex-direction:column}}}}
+{STATIC_PAGE_CSS}
 </style>
 </head>
 <body>
 <header>
   <h1>Weekly Media Industry News</h1>
-  <div class="wk">Week {week} &nbsp;·&nbsp; {date_str} &nbsp;·&nbsp; {len(top)} stories</div>
+  <div class="wk">Week {page["week"]} &nbsp;·&nbsp; {page["date_str"]} &nbsp;·&nbsp; {page["story_count"]} stories</div>
 </header>
-{"".join(sector_blocks_html)}
-{macro_section}
-{archive_section}
-<footer>Weekly Media Industry News &nbsp;·&nbsp; <a href="coverage.html">Coverage Analysis</a> &nbsp;·&nbsp; Generated {date_str}</footer>
+{page["sector_html"]}
+{page["macro_section"]}
+{page["archive_section"]}
+<footer>Weekly Media Industry News &nbsp;·&nbsp; <a href="coverage.html">Coverage Analysis</a> &nbsp;·&nbsp; Generated {page["date_str"]}</footer>
 </body>
 </html>"""
+
+
+def render_static(payload, macro=None, archive_links=None):
+    """Render the full static digest page.
+
+    Args:
+        payload: {"summary", "cluster_index", "top", "items", "week"}, the
+        same shape `_publish_everything` carries after the run.
+        macro: prior-weeks macro-trend prose, or None.
+        archive_links: [(week, url), ...] for the archive nav, or None.
+    """
+    summary = payload["summary"]
+    cluster_index = payload["cluster_index"]
+    top = payload["top"]
+    items = payload["items"]
+    date_str = datetime.now().strftime("%B %d, %Y")
+    picks = parse_spotlight(summary, cluster_index)
+
+    sector_blocks_html = []
+    for sector_key, sector_clusters in sectors_present(top):
+        sector_blocks_html.append(_static_sector_block(
+            sector_key, sector_clusters, picks.get(sector_key, {}), items
+        ))
+
+    return _static_page_shell({
+        "date_str": date_str,
+        "week": payload["week"],
+        "story_count": len(top),
+        "sector_html": "".join(sector_blocks_html),
+        "macro_section": _static_macro_section(macro),
+        "archive_section": _static_archive_section(archive_links),
+    })
 
 
 def publish_static(html, week):
@@ -2216,16 +2537,13 @@ def publish_static(html, week):
     print(f"site: https://storage.googleapis.com/{site_bucket}/digest.html")
 
 
-# ── persistence ───────────────────────────────────────────────────────────────
+# ---- Persistence ----
 
 def load_week_items(conn):
-    """The full rolling 7-day window. Previously this also filtered out
-    items that had already appeared in an earlier digest (used_in_digest=0),
-    but that single-shot gate caused important ongoing stories to vanish at
-    the next run — the rolling window is the right unit, and re-surfacing a
-    persistent topic across two digests is a feature, not a bug. The
-    used_in_digest column is still written by save_digest for informational
-    purposes but no longer gates retrieval here."""
+    """Return every item in the rolling 7-day window, including ones an earlier
+    digest already used. `used_in_digest` is recorded by save_digest for
+    reference and deliberately does not gate retrieval, so a persistent topic
+    can surface across two digests."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     return conn.execute(
         "SELECT id,source,title,url,body,ts FROM items "
@@ -2244,175 +2562,239 @@ def save_digest(conn, top, items, summary, vec):
         "INSERT OR REPLACE INTO digests(week,centroids,vocab,summary,created_at) VALUES(?,?,?,?,?)",
         (week, pickle.dumps(centroids), pickle.dumps(inv_vocab), summary, now_iso()),
     )
-    ids = [items[i]["id"] for c in top for i in c["idxs"]]
+    ids = []
+    for cluster in top:
+        for i in cluster["idxs"]:
+            ids.append(items[i]["id"])
     conn.executemany("UPDATE items SET used_in_digest=1 WHERE id=?", [(i,) for i in ids])
 
 
-# ── orchestration ─────────────────────────────────────────────────────────────
+# ---- Orchestration ----
+
+def _build_corpus(rows):
+    """Enrich this week's rows, cluster them, and embed them."""
+    print(f"digest [2/12] enriching {len(rows)} items")
+    items = enrich(rows)
+
+    print("digest [3/12] building TF-IDF + clustering")
+    fitted = build_tfidf(items)
+    clusters = cluster_average_linkage(fitted["matrix"])
+
+    print(f"digest [4/12] embedding {len(items)} items")
+    texts = []
+    for item in items:
+        body = (item["body"] or "")[:_EMBED_BODY_CHARS]
+        texts.append(f"{item['title']} {body}")
+    embeddings = _embed(texts)
+    if embeddings is None:
+        print("embeddings: unavailable, using lexical-only fallback")
+    else:
+        print(f"embeddings: {embeddings.shape[0]} items × {embeddings.shape[1]} dims")
+
+    return {
+        "items": items,
+        "matrix": fitted["matrix"],
+        "vectorizer": fitted["vectorizer"],
+        "clusters": clusters,
+        "embeddings": embeddings,
+    }
+
+
+def _count_signal_entities(items):
+    counts = defaultdict(int)
+    for item in items:
+        for entity, label in item["entities"].items():
+            if _is_signal_entity(entity, label):
+                counts[entity] += 1
+    return counts
+
+
+def _load_discourse_context(conn):
+    """Load the IDF, aspects, coverage debt, topic bank, and tuned weights.
+
+    Weight tuning runs here, before scoring, so this week uses the latest blend.
+    It no-ops until cluster_signals has accumulated enough weeks.
+
+    Returns:
+        one dictionary of everything the scorer and the filters read.
+    """
+    print("digest [5/12] loading discourse context")
+    idf_result = load_entity_idf(conn)
+    entity_idf, max_idf = idf_result["idf"], idf_result["max_idf"]
+    aspects = get_profile_aspects(conn)
+    try:
+        tune_weights(conn)
+    except Exception as error:
+        print(f"tune_weights failed, continuing with existing weights: {error}")
+    history_weeks = conn.execute(
+        "SELECT COUNT(DISTINCT week) FROM cluster_signals"
+    ).fetchone()[0] or 0
+    return {
+        "entity_idf": entity_idf,
+        "max_idf": max_idf,
+        "aspects": aspects,
+        "exclusion_aspects": get_exclusion_aspects(conn),
+        "debt": compute_coverage_debt(conn, aspects),
+        "bank": load_topic_bank(conn),
+        "weights": load_weights(conn),
+        "history_weeks": history_weeks,
+    }
+
+
+def _rank_clusters(corpus, context, run_state):
+    """Score the clusters, drop the off-profile ones, then select and dedupe.
+
+    Args:
+        corpus: the output of `_build_corpus`.
+        context: the output of `_load_discourse_context`.
+        run_state: {"velocities": ..., "week": ...} for this run.
+
+    Returns:
+        {"top": the selected clusters, "aspect_coverage": coverage for the ledger}
+    """
+    clusters = corpus["clusters"]
+    print(f"digest [6/12] scoring {len(clusters)} clusters")
+    ranking = score_clusters({
+        "clusters": clusters,
+        "items": corpus["items"],
+        "X": corpus["matrix"],
+        "vec": corpus["vectorizer"],
+        "velocities": run_state["velocities"],
+        "bank": context["bank"],
+        "aspects": context["aspects"],
+        "debt": context["debt"],
+        "entity_idf": context["entity_idf"],
+        "max_idf": context["max_idf"],
+        "weights": context["weights"],
+        "week": run_state["week"],
+        "exclusion_aspects": context["exclusion_aspects"],
+        "embeddings": corpus["embeddings"],
+    })
+
+    history_weeks = context["history_weeks"]
+    scored = ranking["scored"]
+    kept = _filter_off_profile(scored, history_weeks)
+    print(f"off-profile filter: {len(scored)} -> {len(kept)} clusters "
+          f"(history_weeks={history_weeks})")
+
+    print("digest [7/12] MMR select + dedup")
+    # Dedup runs before the persistence writes so the topic bank and
+    # cluster_signals reflect the same set the reader is shown.
+    top = _dedupe_top(mmr_dynamic_select(kept), corpus["items"])
+    return {"top": top, "aspect_coverage": ranking["aspect_coverage"]}
+
+
+def _render_coverage(conn):
+    from evaluate import report as eval_report, render_html as eval_render
+    try:
+        return eval_render(eval_report(conn, weeks=COVERAGE_REPORT_WEEKS))
+    except Exception as error:
+        print(f"coverage render failed: {error}")
+        return None
+
+
+def _send_monthly_metrics(week):
+    """Send the self-learning metrics email on the first Sunday of the month."""
+    try:
+        from metrics_email import is_first_sunday_of_month, send_metrics_email
+        if not is_first_sunday_of_month():
+            return
+        with sqlite3.connect(LOCAL_DB) as metrics_conn:
+            send_metrics_email(metrics_conn, week)
+        print(f"monthly metrics email sent for {week}")
+    except Exception as error:
+        print(f"metrics email failed (non-fatal): {error}")
+
+
+def _publish_everything(conn, payload):
+    """Push the database, publish the static site, and send the digest email.
+
+    Everything read from `conn` is read before the connection closes, so the
+    coverage report sees the state that was just committed.
+
+    Args:
+        conn: the open database connection, closed before publishing.
+        payload: {"summary", "cluster_index", "top", "items", "week"}.
+    """
+    from evaluate import publish_coverage
+
+    macro = load_macro_context(conn)
+    archive_links = get_archive_links(conn)
+    coverage_html = _render_coverage(conn)
+    conn.close()
+
+    print("digest [11/12] pushing db + publishing static site")
+    push_db()
+    week = payload["week"]
+    publish_static(render_static(payload, macro, archive_links), week)
+    if coverage_html:
+        publish_coverage(coverage_html, week)
+
+    print("digest [12/12] sending email")
+    send_email(render_email(payload["summary"], payload["cluster_index"],
+                            payload["top"], payload["items"], macro))
+    _send_monthly_metrics(week)
+
 
 def run():
     with pipeline_lock():
         print("digest: starting")
-        print("  · 1/12  Pull DB")
-        print("  · 2/12  Load & enrich items")
-        print("  · 3/12  Build TF-IDF + cluster")
-        print("  · 4/12  Embed items")
-        print("  · 5/12  Load discourse context")
-        print("  · 6/12  Score clusters")
-        print("  · 7/12  MMR select + dedup")
-        print("  · 8/12  Update topic bank")
-        print("  · 9/12  LLM summarise")
-        print("  · 10/12 Save digest state")
-        print("  · 11/12 Push DB + publish")
-        print("  · 12/12 Send email")
-
+        for number, name in enumerate(STEP_PLAN, start=1):
+            print(f"  · {number}/{len(STEP_PLAN)}  {name}")
         print("digest [1/12] pulling db")
         conn = pull_db()
         rows = load_week_items(conn)
-        if len(rows) < 10:
+        if len(rows) < MIN_ITEMS_FOR_DIGEST:
             print(f"too few items: {len(rows)}")
             return
 
-        print(f"digest [2/12] enriching {len(rows)} items")
-        items = enrich(rows)
-        print("digest [3/12] building TF-IDF + clustering")
-        X, vec, edges = build_tfidf(items)
-        clusters = cluster_average_linkage(X)
-
-        print(f"digest [4/12] embedding {len(items)} items")
-        item_texts = [
-            f"{a['title']} {(a['body'] or '')[:_EMBED_BODY_CHARS]}" for a in items
-        ]
-        E = _embed(item_texts)
-        if E is not None:
-            print(f"embeddings: {E.shape[0]} items × {E.shape[1]} dims")
-        else:
-            print("embeddings: unavailable, using lexical-only fallback")
-
-        all_ent_counts = defaultdict(int)
-        for a in items:
-            for e, lbl in a["entities"].items():
-                if _is_signal_entity(e, lbl):
-                    all_ent_counts[e] += 1
-        ent_history = load_entity_history(conn)
-        velocities = compute_velocities(all_ent_counts, ent_history)
-
+        corpus = _build_corpus(rows)
+        items = corpus["items"]
         week = datetime.now(timezone.utc).strftime("%Y-W%V")
+        entity_counts = _count_signal_entities(items)
+        velocities = compute_velocities(entity_counts, load_entity_history(conn))
 
-        print("digest [5/12] loading discourse context")
-        # Discourse-learning context: IDF, aspects, debt, topic bank, weights.
-        entity_idf, max_idf = load_entity_idf(conn)
-        aspects = get_profile_aspects(conn)
-        exclusion_aspects = get_exclusion_aspects(conn)
-        debt = compute_coverage_debt(conn, aspects)
-        bank = load_topic_bank(conn)
-        # tune_weights runs before scoring so this week uses the latest blend;
-        # it no-ops until cluster_signals has accumulated >= 10 weeks.
-        try:
-            tune_weights(conn)
-        except Exception as _tw_exc:
-            print(f"tune_weights failed, continuing with existing weights: {_tw_exc}")
-        weights = load_weights(conn)
+        context = _load_discourse_context(conn)
+        ranking = _rank_clusters(corpus, context, {
+            "velocities": velocities,
+            "week": week,
+        })
+        top = ranking["top"]
 
-        # History depth gates both the off-profile filter's Layer B
-        # (persistence override) and the summary prose mode (warmup vs full).
-        history_weeks = conn.execute(
-            "SELECT COUNT(DISTINCT week) FROM cluster_signals"
-        ).fetchone()[0] or 0
-
-        print(f"digest [6/12] scoring {len(clusters)} clusters")
-        scored, aspect_coverage = score_clusters(
-            clusters, items, X, vec, velocities, bank, aspects, debt,
-            entity_idf, max_idf, weights, week,
-            exclusion_aspects=exclusion_aspects,
-            E=E,
-        )
-
-        # §2.4 — off-profile filter (Layer A always, Layer B at >= 10 weeks).
-        before_filter = len(scored)
-        scored = _filter_off_profile(scored, history_weeks)
-        print(f"off-profile filter: {before_filter} -> {len(scored)} clusters "
-              f"(history_weeks={history_weeks})")
-
-        print("digest [7/12] MMR select + dedup")
-        # §2.5 — dynamic, score-knee-aware selection (replaces k=15).
-        top = mmr_dynamic_select(scored)
-
-        # §2.3 — cross-cluster URL + title-signature dedup BEFORE persistence
-        # writes so the topic bank and cluster_signals reflect the deduped set.
-        top = _dedupe_top(top, items)
-
-        # §D — Longitudinal context for the LLM, computed from the bank state
-        # BEFORE update_topic_bank mutates it (we want the pre-this-week
-        # last_week values for "returns after X-week gap" framing).
         longitudinal_context = build_longitudinal_context(
-            conn, week, all_ent_counts, top, bank,
+            conn, week, entity_counts, top, context["bank"],
         )
 
         print("digest [8/12] updating topic bank")
-        # Commit topic-bank state from the selected top clusters, then persist
-        # this week's per-cluster signal vectors (keyed by topic_id) for A5
-        # retrospective tuning.
-        update_topic_bank(conn, top, vec, week)
+        update_topic_bank(conn, top, corpus["vectorizer"], week)
         save_cluster_signals(conn, week, top)
-        save_coverage_ledger(conn, week, aspect_coverage)
+        save_coverage_ledger(conn, week, ranking["aspect_coverage"])
 
-        macro_context = load_macro_context(conn)
-        history_depth = "full" if history_weeks >= 10 else "warmup"
+        history_depth = "full" if context["history_weeks"] >= FULL_HISTORY_WEEKS else "warmup"
         print(f"digest [9/12] LLM summarise ({len(top)} clusters, history={history_depth})")
-        summary, cluster_index = summarise(
-            top, items, macro_context, history_depth=history_depth,
+        summarised = summarise(
+            top, items, load_macro_context(conn), history_depth=history_depth,
             longitudinal_context=longitudinal_context,
         )
+        summary, cluster_index = summarised["summary"], summarised["cluster_index"]
 
         print("digest [10/12] saving digest state")
-        save_digest(conn, top, items, summary, vec)
-        save_entity_history(conn, dict(all_ent_counts), week)
-
+        save_digest(conn, top, items, summary, corpus["vectorizer"])
+        save_entity_history(conn, dict(entity_counts), week)
         macro_new = generate_macro_trends(conn)
         conn.commit()
 
-        display_macro = load_macro_context(conn)
-        archive_links = get_archive_links(conn)
-        # Build coverage HTML before closing the connection so evaluate.py can
-        # read the same DB state we just committed.
-        from evaluate import report as eval_report, render_html as eval_render, publish_coverage
-        try:
-            coverage_html = eval_render(eval_report(conn, weeks=12))
-        except Exception as e:
-            print(f"coverage render failed: {e}")
-            coverage_html = None
-        conn.close()
-
-        print("digest [11/12] pushing db + publishing static site")
-        push_db()
-
-        publish_static(
-            render_static(summary, cluster_index, top, items, week,
-                          display_macro, archive_links),
-            week,
-        )
-        if coverage_html:
-            publish_coverage(coverage_html, week)
-
-        print("digest [12/12] sending email")
-        send_email(render_email(summary, cluster_index, top, items, display_macro))
-
-        # Monthly self-learning metrics email — only on the first Sunday of the
-        # month. Re-open the DB read-only since we already closed/pushed above;
-        # we don't mutate state here, so this stays a clean side-effect.
-        try:
-            from metrics_email import is_first_sunday_of_month, send_metrics_email
-            if is_first_sunday_of_month():
-                with sqlite3.connect(LOCAL_DB) as mconn:
-                    send_metrics_email(mconn, week)
-                print(f"monthly metrics email sent for {week}")
-        except Exception as e:
-            print(f"metrics email failed (non-fatal): {e}")
+        _publish_everything(conn, {
+            "summary": summary,
+            "cluster_index": cluster_index,
+            "top": top,
+            "items": items,
+            "week": week,
+        })
 
         print(
             f"digest done: {len(top)} clusters from {len(rows)} items "
-            f"({len(clusters)} total), {len(all_ent_counts)} entities tracked"
+            f"({len(corpus['clusters'])} total), {len(entity_counts)} entities tracked"
             + (f", macro updated ({week})" if macro_new else "")
         )
 
