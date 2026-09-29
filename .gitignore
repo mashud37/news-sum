@@ -33,3 +33,4 @@ temp/
 # VCS metadata (defensive; only meaningful when this folder is a sub-tree
 # of a larger workspace and another tool tars it up).
 .git/
+.claude/
